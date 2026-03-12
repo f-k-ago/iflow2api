@@ -20,19 +20,15 @@ services:
       # 服务配置
       - HOST=0.0.0.0
       - PORT=28000
-      # iFlow 配置 (可选，也可以通过挂载配置文件)
-      # - IFLOW_API_KEY=sk-xxx
-      # - IFLOW_BASE_URL=https://apis.iflow.cn/v1
-      # 速率限制配置
-      - RATE_LIMIT_ENABLED=true
-      - RATE_LIMIT_PER_MINUTE=60
-      - RATE_LIMIT_PER_HOUR=1000
-      - RATE_LIMIT_PER_DAY=10000
-    volumes:
-      # 挂载 iFlow 配置目录 (包含 API Key 和 OAuth Token)
-      - ~/.iflow:/home/appuser/.iflow:ro
-      # 挂载应用配置目录
-      - iflow2api-config:/home/appuser/.iflow2api
+      # 并发限制配置（官方规则：每个用户最多1个并发）
+      - ENABLE_CONCURRENCY_LIMIT=true
+      - MAX_CONCURRENT_REQUESTS=1
+      # 速率限制配置（可选，单用户可以关闭）
+      - RATE_LIMIT_ENABLED=falsevolumes:
+      # 配置目录（通过 Web UI 管理，支持 OAuth 自动刷新）
+      - iflow2api-config:/home/appuser/.iflow
+      # 如果已有本地配置，可以挂载（二选一）：
+      # - ~/.iflow:/home/appuser/.iflow:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:28000/health"]
       interval: 30s
