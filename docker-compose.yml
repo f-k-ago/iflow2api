@@ -16,15 +16,12 @@ services:
     restart: unless-stopped
     ports:
       - "28000:28000"
+    env_file:
+      - .env
     environment:
       # 服务配置
       - HOST=0.0.0.0
-      - PORT=28000
-      # 并发限制配置（官方规则：每个用户最多1个并发）
-      - ENABLE_CONCURRENCY_LIMIT=true
-      - MAX_CONCURRENT_REQUESTS=1
-      # 速率限制配置（可选，单用户可以关闭）
-      - RATE_LIMIT_ENABLED=falsevolumes:
+      - PORT=28000volumes:
       # 配置目录（通过 Web UI 管理，支持 OAuth 自动刷新）
       - iflow2api-config:/home/appuser/.iflow
       # 如果已有本地配置，可以挂载（二选一）：
