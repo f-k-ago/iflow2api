@@ -418,13 +418,22 @@ async def get_oauth_url(
 ) -> dict[str, Any]:
     """获取 iFlow OAuth 登录 URL"""
     from ..oauth import IFlowOAuth
-    
+    from ..settings import load_settings
+
+    settings = load_settings()
     oauth = IFlowOAuth()
-    # 从请求中获取实际端口
-    port = request.url.port or 28000
-    redirect_uri = f"http://localhost:{port}/admin/oauth/callback"
+
+    # 构建回调地址
+    if settings.oauth_callback_base_url:
+        # 使用配置的公网地址
+        redirect_uri = f"{settings.oauth_callback_base_url.rstrip('/')}/admin/oauth/callback"
+    else:
+        # 使用 localhost（默认行为）
+        port = request.url.port or 28000
+        redirect_uri = f"http://localhost:{port}/admin/oauth/callback"
+
     auth_url = oauth.get_auth_url(redirect_uri=redirect_uri)
-    
+
     return {
         "success": True,
         "auth_url": auth_url,

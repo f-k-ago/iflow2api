@@ -23,6 +23,11 @@ class AppSettings(BaseModel):
     host: str = "0.0.0.0"
     port: int = Field(default=28000, ge=1, le=65535)
 
+    # OAuth 回调地址配置
+    # 如果部署在远程服务器，需要设置为公网地址
+    # 例如: https://your-domain.com 或 http://your-ip:28000
+    oauth_callback_base_url: str = ""  # 空字符串表示使用 localhost
+
     # iFlow 配置 (从 ~/.iflow/settings.json 读取)
     api_key: str = ""
     base_url: str = "https://apis.iflow.cn/v1"
