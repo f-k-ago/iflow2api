@@ -1021,8 +1021,9 @@ async def list_models():
     try:
         proxy = get_proxy()
         return await proxy.get_models()
-    except IFlowNotConfiguredError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    except IFlowNotConfiguredError:
+        logger.info("iFlow 未配置，/v1/models 回退返回静态模型列表")
+        return IFlowProxy.build_models_response()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

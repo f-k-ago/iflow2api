@@ -513,20 +513,10 @@ class IFlowProxy:
             await self._client.close()
             self._client = None
 
-    async def get_models(self) -> dict:
-        """
-        获取可用模型列表
-
-        iFlow API 没有公开的 /models 端点，因此返回已知的模型列表。
-        模型列表来源于 iflow-cli 源码中的 SUPPORTED_MODELS。
-        使用 iFlow-Cli User-Agent 可以解锁这些高级模型。
-        
-        注意：所有模型都支持图像输入，由上游 API 决定如何处理。
-        """
-        # iFlow CLI 支持的模型列表 (来源: uniflow_round2 反混淆代码)
-        # 与官方客户端 0.5.17 版本完全一致，避免被检测
-        # 2026.3.12 更新
-        models = [
+    @staticmethod
+    def _known_models() -> list[dict[str, str]]:
+        """返回 iFlow 已知模型列表。"""
+        return [
             {"id": "glm-4.7", "name": "GLM-4.7", "description": "智谱 GLM-4.7"},
             {
                 "id": "iFlow-ROME-30BA3B",
@@ -566,12 +556,11 @@ class IFlowProxy:
             },
         ]
 
-        import time
-
+    @classmethod
+    def build_models_response(cls) -> dict:
+        """构建 OpenAI 兼容模型列表响应。"""
+        models = cls._known_models()
         current_time = int(time.time())
-
-        # 返回 OpenAI 兼容格式
-        # 所有模型都标记为支持视觉，由上游 API 决定如何处理
         return {
             "object": "list",
             "data": [
@@ -587,6 +576,21 @@ class IFlowProxy:
                 for model in models
             ],
         }
+
+    async def get_models(self) -> dict:
+        """
+        获取可用模型列表
+
+        iFlow API 没有公开的 /models 端点，因此返回已知的模型列表。
+        模型列表来源于 iflow-cli 源码中的 SUPPORTED_MODELS。
+        使用 iFlow-Cli User-Agent 可以解锁这些高级模型。
+        
+        注意：所有模型都支持图像输入，由上游 API 决定如何处理。
+        """
+        # iFlow CLI 支持的模型列表 (来源: uniflow_round2 反混淆代码)
+        # 与官方客户端 0.5.17 版本完全一致，避免被检测
+        # 2026.3.12 更新
+        return self.build_models_response()
 
     @overload
     async def chat_completions(
