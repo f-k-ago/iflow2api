@@ -525,11 +525,16 @@ async def oauth_callback(
     """处理 OAuth 回调（POST 请求 - 从前端发送）"""
     from ..oauth import IFlowOAuth
     from ..settings import load_settings, save_settings
-    
+
+    settings = load_settings()
     oauth = IFlowOAuth()
-    # 从请求中获取实际端口
-    port = fastapi_request.url.port or 28000
-    redirect_uri = f"http://localhost:{port}/admin/oauth/callback"
+
+    # 构建回调地址（必须与获取 auth_url 时一致）
+    if settings.oauth_callback_base_url:
+        redirect_uri = f"{settings.oauth_callback_base_url.rstrip('/')}/admin/oauth/callback"
+    else:
+        port = fastapi_request.url.port or 28000
+        redirect_uri = f"http://localhost:{port}/admin/oauth/callback"
     
     try:
         # 使用授权码获取 token
