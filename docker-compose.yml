@@ -20,7 +20,8 @@ services:
       - .env
     environment:
       - HOST=0.0.0.0
-      - PORT=28000volumes:
+      - PORT=28000
+    volumes:
       # 配置目录（通过 Web UI 管理，支持 OAuth 自动刷新）
       - iflow2api-config:/home/appuser/.iflow
       # 如果已有本地配置，可以挂载（二选一）：
