@@ -239,8 +239,10 @@ async function loadAccountInfo() {
         const authTypeMap = {
             'api-key': 'API Key',
             'oauth-iflow': 'OAuth',
-            'cookie': 'Cookie'
-        };document.getElementById('account-auth-type').textContent = authTypeMap[data.auth_type] || data.auth_type;
+            'cookie': 'Cookie',
+            'not_logged_in': '未登录'
+        };
+        document.getElementById('account-auth-type').textContent = authTypeMap[data.auth_type] || data.auth_type || '未知';
 
         // 更新 API Key
         document.getElementById('account-api-key').textContent = data.api_key_masked || '未配置';
@@ -248,8 +250,10 @@ async function loadAccountInfo() {
         // 更新邮箱和手机号（如果有）
         const emailRow = document.getElementById('account-email-row');
         const phoneRow = document.getElementById('account-phone-row');
+        const cookieExpireRow = document.getElementById('account-cookie-expire-row');
 
-        if (data.email) {document.getElementById('account-email').textContent = data.email;
+        if (data.email) {
+            document.getElementById('account-email').textContent = data.email;
             emailRow.style.display = '';
         } else {
             emailRow.style.display = 'none';
@@ -260,6 +264,13 @@ async function loadAccountInfo() {
             phoneRow.style.display = '';
         } else {
             phoneRow.style.display = 'none';
+        }
+
+        if (data.cookie_expires_at) {
+            document.getElementById('account-cookie-expire').textContent = data.cookie_expires_at;
+            cookieExpireRow.style.display = '';
+        } else {
+            cookieExpireRow.style.display = 'none';
         }
     } catch (error) {
         console.error('Load account info error:', error);

@@ -304,27 +304,95 @@ async def get_metrics(username: str = Depends(get_current_user)) -> dict[str, An
 
 # ==================== 配置管理 ====================
 
+def _mask_secret(value: str, head: int = 8, tail: int = 4) -> str:
+    """掩码敏感字符串，避免在页面中直接泄露完整凭据。"""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= 2:
+        return raw[0] + "*"
+    if len(raw) <= head + tail:
+        keep = max(1, len(raw) // 3)
+        return f"{raw[:keep]}...{raw[-tail:]}"
+    return f"{raw[:head]}...{raw[-tail:]}"
+
+
 @admin_router.get("/account-info")
 async def get_account_info(username: str = Depends(get_current_user)) -> dict[str, Any]:
     """获取当前登录的账号信息"""
     from ..settings import load_settings
     from ..oauth import IFlowOAuth
+    from ..config import load_iflow_config
 
     settings = load_settings()
-    account_info = {
-        "auth_type": settings.auth_type,
-        "has_api_key": bool(settings.api_key),
-        "api_key_masked": settings.api_key[:8] + "..." + settings.api_key[-4:] if settings.api_key and len(settings.api_key) > 12 else "",}
+    api_key = (settings.api_key or "").strip()
+    auth_type = (settings.auth_type or "").strip()
+    oauth_access_token = (settings.oauth_access_token or "").strip()
+    cookie = (settings.cookie or "").strip()
+    cookie_email = (settings.cookie_email or "").strip()
+    cookie_expires_at = settings.cookie_expires_at
 
-    # 如果是 OAuth 登录，尝试获取用户信息
-    if settings.auth_type == "oauth-iflow" and settings.oauth_access_token:
+    # 兼容：如果应用配置未同步到位，回退到 ~/.iflow/settings.json 读取
+    try:
+        iflow_config = load_iflow_config()
+    except Exception:
+        iflow_config = None
+
+    if iflow_config:
+        if not api_key and iflow_config.api_key:
+            api_key = iflow_config.api_key.strip()
+        if auth_type in ("", "api-key") and iflow_config.auth_type in ("oauth-iflow", "cookie"):
+            auth_type = iflow_config.auth_type
+        if not oauth_access_token and iflow_config.oauth_access_token:
+            oauth_access_token = iflow_config.oauth_access_token.strip()
+        if not cookie and iflow_config.cookie:
+            cookie = iflow_config.cookie.strip()
+        if not cookie_email and iflow_config.cookie_email:
+            cookie_email = iflow_config.cookie_email.strip()
+        if not cookie_expires_at and iflow_config.cookie_expires_at:
+            cookie_expires_at = iflow_config.cookie_expires_at
+
+    # 若配置中的 auth_type 不可信，按现有凭据推断
+    if auth_type not in ("oauth-iflow", "cookie", "api-key"):
+        if oauth_access_token:
+            auth_type = "oauth-iflow"
+        elif cookie:
+            auth_type = "cookie"
+        elif api_key:
+            auth_type = "api-key"
+        else:
+            auth_type = "not_logged_in"
+
+    if auth_type == "api-key" and not api_key and (oauth_access_token or cookie):
+        auth_type = "oauth-iflow" if oauth_access_token else "cookie"
+
+    if not api_key and not oauth_access_token and not cookie:
+        auth_type = "not_logged_in"
+
+    account_info = {
+        "auth_type": auth_type,
+        "has_api_key": bool(api_key),
+        "api_key_masked": _mask_secret(api_key),
+    }
+
+    # Cookie 模式直接返回已保存的账号信息
+    if auth_type == "cookie":
+        if cookie_email:
+            account_info["email"] = cookie_email
+        if cookie_expires_at:
+            account_info["cookie_expires_at"] = cookie_expires_at
+
+    # OAuth 模式尝试实时拉取用户信息
+    if auth_type == "oauth-iflow" and oauth_access_token:
         try:
             oauth = IFlowOAuth()
-            user_info = await oauth.get_user_info(settings.oauth_access_token)
+            user_info = await oauth.get_user_info(oauth_access_token)
             account_info["email"] = user_info.get("email", "")
             account_info["phone"] = user_info.get("phone", "")
         except Exception:
-            pass
+            # 拉取失败时回退到本地已知信息
+            if cookie_email and not account_info.get("email"):
+                account_info["email"] = cookie_email
 
     return account_info
 
