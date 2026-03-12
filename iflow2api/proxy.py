@@ -618,6 +618,30 @@ class IFlowProxy:
             非流式: 返回完整响应 dict
             流式: 返回字节流迭代器
         """
+        # 并发限制：每个 API Key 最多 1 个并发请求（官方限制）
+        from .concurrency_limiter import get_concurrency_limiter
+        from .settings import load_settings
+
+        settings = load_settings()
+
+        # 如果启用了并发限制，则使用并发控制
+        if settings.enable_concurrency_limit:
+            limiter = get_concurrency_limiter(max_concurrent=settings.max_concurrent_requests)
+            # 使用 API Key 作为并发限制的标识
+            async with limiter.acquire(self.config.api_key, timeout=300.0):
+                return await self._chat_completions_impl(request_body, stream)
+        else:
+            # 未启用并发限制，直接执行
+            return await self._chat_completions_impl(request_body, stream)
+
+    async def _chat_completions_impl(
+        self,
+        request_body: dict,
+        stream: bool = False,
+    ) -> "dict | AsyncIterator[bytes]":
+        """
+        chat completions 的实际实现（内部方法）
+        """
         client = await self._get_client()
         
         # 加载配置以获取思考链设置

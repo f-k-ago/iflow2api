@@ -45,7 +45,14 @@ class AppSettings(BaseModel):
     # 思考链设置
     preserve_reasoning_content: bool = True
 
-    # 上游 API 并发设置
+    # 官方并发限制设置
+    # 官方规则：每个用户（API Key）最多同时 1 个请求
+    # - 流式请求：主动取消后立即释放令牌
+    # - 非流式请求：主动取消后需等待运行完毕才释放令牌
+    enable_concurrency_limit: bool = True
+    max_concurrent_requests: int = 1
+
+    # 上游 API 并发设置（已废弃，由 enable_concurrency_limit 替代）
     # 注意：过高的并发数可能导致上游 API 返回 429 限流错误
     # 默认值为 1，表示串行处理；建议范围 1-10
     api_concurrency: int = Field(default=1, ge=1, le=10)
