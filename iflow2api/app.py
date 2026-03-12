@@ -6,6 +6,7 @@ import logging
 import uuid
 import asyncio
 import time
+from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -537,17 +538,48 @@ def reload_proxy() -> None:
 def get_proxy() -> IFlowProxy:
     """获取代理实例
 
-    如果 iFlow 配置不存在，抛出 IFlowNotConfiguredError 异常。
+    读取顺序：
+    1. ~/.iflow/settings.json（iFlow CLI 原生配置）
+    2. ~/.iflow2api/config.json（WebUI 应用配置，作为回退）
+
+    若两者都不可用，抛出 IFlowNotConfiguredError 异常。
     """
     global _proxy, _config
     if _proxy is None:
         try:
             _config = load_iflow_config()
-            _proxy = IFlowProxy(_config)
         except (FileNotFoundError, ValueError) as e:
-            raise IFlowNotConfiguredError(
-                "iFlow 未配置，请通过 WebUI 完成登录: http://localhost:28000/admin"
-            ) from e
+            from .settings import load_settings
+
+            settings = load_settings()
+            api_key = (settings.api_key or "").strip()
+            if not api_key:
+                raise IFlowNotConfiguredError(
+                    "iFlow 未配置，请通过 WebUI 完成登录: http://localhost:28000/admin"
+                ) from e
+
+            oauth_expires_at = None
+            if settings.oauth_expires_at:
+                try:
+                    oauth_expires_at = datetime.fromisoformat(settings.oauth_expires_at)
+                except ValueError:
+                    logger.warning("oauth_expires_at 格式无效，忽略回退值: %s", settings.oauth_expires_at)
+
+            _config = IFlowConfig(
+                api_key=api_key,
+                base_url=(settings.base_url or "https://apis.iflow.cn/v1"),
+                auth_type=(settings.auth_type or None),
+                oauth_access_token=(settings.oauth_access_token or None),
+                oauth_refresh_token=(settings.oauth_refresh_token or None),
+                oauth_expires_at=oauth_expires_at,
+                api_key_expires_at=oauth_expires_at,
+                cookie=(settings.cookie or None),
+                cookie_email=(settings.cookie_email or None),
+                cookie_expires_at=settings.cookie_expires_at,
+            )
+            logger.info("iFlow CLI 配置不可用，已回退使用 iflow2api 应用配置")
+
+        _proxy = IFlowProxy(_config)
     return _proxy
 
 
