@@ -525,9 +525,18 @@ class IFlowNotConfiguredError(Exception):
     pass
 
 
+def reload_proxy() -> None:
+    """重新加载代理实例（用于配置更新后刷新）"""
+    global _proxy, _config
+    if _proxy:
+        asyncio.create_task(_proxy.close())
+    _proxy = None
+    _config = None
+
+
 def get_proxy() -> IFlowProxy:
     """获取代理实例
-    
+
     如果 iFlow 配置不存在，抛出 IFlowNotConfiguredError 异常。
     """
     global _proxy, _config

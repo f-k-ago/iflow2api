@@ -188,6 +188,7 @@ function showMainPage() {
 
     // 初始化数据
     loadStatus();
+    loadAccountInfo();
     loadSettings();
     loadUsers();
 
@@ -226,6 +227,44 @@ function showSection(sectionId) {
 }
 
 // ==================== 数据加载 ====================
+
+/**
+ * 加载账号信息
+ */
+async function loadAccountInfo() {
+    try {
+        const data = await apiRequest('/account-info');
+
+        // 更新认证方式
+        const authTypeMap = {
+            'api-key': 'API Key',
+            'oauth-iflow': 'OAuth',
+            'cookie': 'Cookie'
+        };document.getElementById('account-auth-type').textContent = authTypeMap[data.auth_type] || data.auth_type;
+
+        // 更新 API Key
+        document.getElementById('account-api-key').textContent = data.api_key_masked || '未配置';
+
+        // 更新邮箱和手机号（如果有）
+        const emailRow = document.getElementById('account-email-row');
+        const phoneRow = document.getElementById('account-phone-row');
+
+        if (data.email) {document.getElementById('account-email').textContent = data.email;
+            emailRow.style.display = '';
+        } else {
+            emailRow.style.display = 'none';
+        }
+
+        if (data.phone) {
+            document.getElementById('account-phone').textContent = data.phone;
+            phoneRow.style.display = '';
+        } else {
+            phoneRow.style.display = 'none';
+        }
+    } catch (error) {
+        console.error('Load account info error:', error);
+    }
+}
 
 /**
  * 加载系统状态
@@ -438,6 +477,7 @@ async function cookieLogin() {
             cookieStatus.textContent = '';
             closeCookieModal();
             loadSettings();
+            loadAccountInfo();
         } else {
             cookieStatus.textContent = `登录失败: ${result.message}`;
             cookieStatus.style.color = 'red';
@@ -509,6 +549,7 @@ async function oauthLogin() {
                         showToast(result.message, 'success');
                         // 更新表单
                         document.getElementById('setting-api-key').value = result.api_key || '';
+                        loadAccountInfo();
                     } catch (error) {
                         showToast(error.message, 'error');
                     }

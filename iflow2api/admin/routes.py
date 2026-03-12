@@ -305,11 +305,36 @@ async def get_metrics(username: str = Depends(get_current_user)) -> dict[str, An
 
 # ==================== 配置管理 ====================
 
+@admin_router.get("/account-info")
+async def get_account_info(username: str = Depends(get_current_user)) -> dict[str, Any]:
+    """获取当前登录的账号信息"""
+    from ..settings import load_settings
+    from ..oauth import IFlowOAuth
+
+    settings = load_settings()
+    account_info = {
+        "auth_type": settings.auth_type,
+        "has_api_key": bool(settings.api_key),
+        "api_key_masked": settings.api_key[:8] + "..." + settings.api_key[-4:] if settings.api_key and len(settings.api_key) > 12 else "",}
+
+    # 如果是 OAuth 登录，尝试获取用户信息
+    if settings.auth_type == "oauth-iflow" and settings.oauth_access_token:
+        try:
+            oauth = IFlowOAuth()
+            user_info = await oauth.get_user_info(settings.oauth_access_token)
+            account_info["email"] = user_info.get("email", "")
+            account_info["phone"] = user_info.get("phone", "")
+        except Exception:
+            pass
+
+    return account_info
+
+
 @admin_router.get("/settings")
 async def get_settings(username: str = Depends(get_current_user)) -> dict[str, Any]:
     """获取应用设置"""
     from ..settings import load_settings
-    
+
     settings = load_settings()
     return {
         "host": settings.host,
@@ -555,6 +580,10 @@ async def cookie_login(
         settings.auth_type = "cookie"
         save_settings(settings)
 
+        # 重新加载代理实例
+        from ..app import reload_proxy
+        reload_proxy()
+
         return {
             "success": True,
             "message": "Cookie 登录成功",
@@ -620,7 +649,11 @@ async def oauth_callback(
         if token_data.get("expires_at"):
             settings.oauth_expires_at = token_data["expires_at"].isoformat()
         save_settings(settings)
-        
+
+        # 重新加载代理实例
+        from ..app import reload_proxy
+        reload_proxy()
+
         return {
             "success": True,
             "message": "登录成功！配置已自动更新",
