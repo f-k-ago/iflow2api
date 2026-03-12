@@ -80,7 +80,6 @@ class IFlowOAuth:
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
                 "Authorization": f"Basic {credentials}",
-                "User-Agent": "iFlow-Cli",
             },
             timeout=30.0,
         )
