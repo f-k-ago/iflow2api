@@ -19,7 +19,6 @@ services:
     env_file:
       - .env
     environment:
-      # 服务配置
       - HOST=0.0.0.0
       - PORT=28000volumes:
       # 配置目录（通过 Web UI 管理，支持 OAuth 自动刷新）
