@@ -1,4 +1,4 @@
-"""应用配置管理 - 使用 ~/.iflow/settings.json 统一管理配置"""
+"""应用配置管理。"""
 
 import json
 import logging
@@ -9,10 +9,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from .config import load_iflow_config, save_iflow_config, IFlowConfig
 from .crypto import ConfigEncryption
-from .autostart import set_auto_start as _set_auto_start
-from .autostart import get_auto_start as _get_auto_start
 
 logger = logging.getLogger("iflow2api")
 
@@ -102,11 +99,11 @@ class AppSettings(BaseModel):
     # 例如: https://your-domain.com 或 http://your-ip:28000
     oauth_callback_base_url: str = ""  # 空字符串表示使用 localhost
 
-    # iFlow 配置 (从 ~/.iflow/settings.json 读取)
+    # 上游主账号字段
     api_key: str = ""
     base_url: str = DEFAULT_BASE_URL
 
-    # OAuth 配置 (从 ~/.iflow/settings.json 读取)
+    # OAuth / Cookie 字段
     auth_type: str = "api-key"
     oauth_access_token: str = ""
     oauth_refresh_token: str = ""
@@ -115,13 +112,7 @@ class AppSettings(BaseModel):
     cookie_email: str = ""
     cookie_expires_at: Optional[str] = None
 
-    # 应用设置
-    auto_start: bool = False
-    start_minimized: bool = False
-    close_action: str = "minimize_to_tray"
-    auto_run_server: bool = False
-
-    # 主题设置
+    # 界面设置
     theme_mode: str = "system"
 
     # 思考链设置
@@ -207,7 +198,7 @@ def list_upstream_accounts(settings: AppSettings) -> list[UpstreamAccount]:
 
 
 def get_primary_account(settings: AppSettings, include_disabled: bool = False) -> Optional[UpstreamAccount]:
-    """获取主账号，供兼容层和信息展示使用。"""
+    """获取主账号，供当前配置和信息展示使用。"""
     accounts = list_upstream_accounts(settings)
     if not accounts:
         return None
@@ -411,18 +402,6 @@ def load_settings() -> AppSettings:
                         except Exception as account_error:
                             logger.warning("读取上游账号配置失败，已跳过: %s", account_error)
                     settings.upstream_accounts = loaded_accounts
-                if "auto_start" in data:
-                    settings.auto_start = data["auto_start"]
-                if "start_minimized" in data:
-                    settings.start_minimized = data["start_minimized"]
-                if "close_action" in data:
-                    settings.close_action = data["close_action"]
-                elif "minimize_to_tray" in data:
-                    # 兼容旧配置：minimize_to_tray=True -> close_action="minimize_to_tray"
-                    # minimize_to_tray=False -> close_action="exit"
-                    settings.close_action = "minimize_to_tray" if data["minimize_to_tray"] else "exit"
-                if "auto_run_server" in data:
-                    settings.auto_run_server = data["auto_run_server"]
                 if "theme_mode" in data:
                     settings.theme_mode = data["theme_mode"]
                 # 语言设置
@@ -472,33 +451,6 @@ def load_settings() -> AppSettings:
         except Exception as _e:
             logger.warning("读取应用配置文件失败: %s", _e)
 
-    # 如果 api_key 为空，尝试从 ~/.iflow/settings.json 加载
-    if not settings.api_key:
-        try:
-            iflow_config = load_iflow_config()
-            if iflow_config.api_key:
-                settings.api_key = iflow_config.api_key
-            if iflow_config.base_url:
-                settings.base_url = iflow_config.base_url
-            if iflow_config.auth_type:
-                settings.auth_type = iflow_config.auth_type
-            if iflow_config.oauth_access_token:
-                settings.oauth_access_token = iflow_config.oauth_access_token
-            if iflow_config.oauth_refresh_token:
-                settings.oauth_refresh_token = iflow_config.oauth_refresh_token
-            if iflow_config.oauth_expires_at:
-                settings.oauth_expires_at = iflow_config.oauth_expires_at.isoformat()
-            if iflow_config.cookie:
-                settings.cookie = iflow_config.cookie
-            if iflow_config.cookie_email:
-                settings.cookie_email = iflow_config.cookie_email
-            if iflow_config.cookie_expires_at:
-                settings.cookie_expires_at = iflow_config.cookie_expires_at
-        except (FileNotFoundError, ValueError):
-            pass  # 首次运行剪未登录时正常
-        except Exception as _e:
-            logger.warning("从 iFlow 配置加载失败: %s", _e)
-
     if settings.upstream_accounts:
         sync_legacy_auth_fields(settings)
 
@@ -510,9 +462,7 @@ def save_settings(settings: AppSettings) -> None:
     保存配置
 
     所有设置都保存到 ~/.iflow2api/config.json
-    同时也保存到 ~/.iflow/settings.json 以保持兼容性
     """
-    # 1. 保存所有设置到 ~/.iflow2api/config.json
     config_dir = get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
     settings.upstream_accounts = [_normalize_account(account) for account in settings.upstream_accounts]
@@ -542,11 +492,7 @@ def save_settings(settings: AppSettings) -> None:
         "cookie": _encrypt_token(settings.cookie),
         "cookie_email": settings.cookie_email,
         "cookie_expires_at": settings.cookie_expires_at,
-        # 应用设置
-        "auto_start": settings.auto_start,
-        "start_minimized": settings.start_minimized,
-        "close_action": settings.close_action,
-        "auto_run_server": settings.auto_run_server,
+        # 界面设置
         "theme_mode": settings.theme_mode,
         # 思考链设置
         "preserve_reasoning_content": settings.preserve_reasoning_content,
@@ -571,64 +517,3 @@ def save_settings(settings: AppSettings) -> None:
     config_path = get_config_path()
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(app_data, f, indent=2, ensure_ascii=False)
-
-    # 2. 同时保存到 ~/.iflow/settings.json 以保持兼容性（Docker 中可能只读，忽略错误）
-    try:
-        existing_config = load_iflow_config()
-    except (FileNotFoundError, ValueError):
-        existing_config = IFlowConfig(api_key="", base_url="https://apis.iflow.cn/v1")
-    oauth_expires_at_dt: Optional[datetime] = None
-    if settings.oauth_expires_at:
-        try:
-            oauth_expires_at_dt = datetime.fromisoformat(settings.oauth_expires_at)
-        except ValueError:
-            logger.warning("oauth_expires_at 格式无效，跳过同步: %s", settings.oauth_expires_at)
-
-    # 同步完整认证字段，避免 WebUI 与 CLI 配置出现漂移
-    if (
-        existing_config.api_key != settings.api_key
-        or existing_config.base_url != settings.base_url
-        or (existing_config.auth_type or "") != settings.auth_type
-        or (existing_config.oauth_access_token or "") != settings.oauth_access_token
-        or (existing_config.oauth_refresh_token or "") != settings.oauth_refresh_token
-        or ((existing_config.oauth_expires_at.isoformat() if existing_config.oauth_expires_at else None) != settings.oauth_expires_at)
-        or (existing_config.cookie or "") != settings.cookie
-        or (existing_config.cookie_email or "") != settings.cookie_email
-        or (existing_config.cookie_expires_at or None) != settings.cookie_expires_at
-    ):
-        existing_config.api_key = settings.api_key
-        existing_config.base_url = settings.base_url
-        existing_config.auth_type = settings.auth_type
-        existing_config.oauth_access_token = settings.oauth_access_token
-        existing_config.oauth_refresh_token = settings.oauth_refresh_token
-        existing_config.oauth_expires_at = oauth_expires_at_dt
-        existing_config.api_key_expires_at = oauth_expires_at_dt
-        existing_config.cookie = settings.cookie
-        existing_config.cookie_email = settings.cookie_email
-        existing_config.cookie_expires_at = settings.cookie_expires_at
-        try:
-            save_iflow_config(existing_config)
-        except (PermissionError, OSError) as e:
-            # Docker 中 ~/.iflow 可能只读挂载，忽略写入错误
-            logger.debug("无法写入 ~/.iflow/settings.json（可能是只读挂载）: %s", e)
-
-
-def set_auto_start(enabled: bool) -> bool:
-    """设置开机自启动（跨平台）
-
-    支持 Windows、macOS、Linux
-    """
-    return _set_auto_start(enabled)
-
-
-def get_auto_start() -> bool:
-    """检查是否已设置开机自启动（跨平台）"""
-    return _get_auto_start()
-
-
-def import_from_iflow_cli() -> Optional[IFlowConfig]:
-    """从 iFlow CLI 导入配置"""
-    try:
-        return load_iflow_config()
-    except Exception:
-        return None

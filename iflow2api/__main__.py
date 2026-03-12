@@ -1,4 +1,4 @@
-"""iflow2api 命令行入口"""
+"""iflow2api 模块入口。"""
 
 from .app import main
 

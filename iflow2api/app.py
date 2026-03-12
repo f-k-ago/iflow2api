@@ -7,7 +7,6 @@ import os as _os
 import uuid
 import asyncio
 import time
-from datetime import datetime
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Optional
 
@@ -532,55 +531,22 @@ def reload_proxy() -> None:
 
 
 def get_proxy() -> IFlowProxy:
-    """获取代理实例
-
-    读取顺序：
-    1. ~/.iflow/settings.json（iFlow CLI 原生配置）
-    2. ~/.iflow2api/config.json（WebUI 应用配置，作为回退）
-
-    若两者都不可用，抛出 IFlowNotConfiguredError 异常。
-    """
+    """获取代理实例。"""
     global _proxy, _config
     if _proxy is None:
         try:
             _config = load_iflow_config()
         except (FileNotFoundError, ValueError) as e:
-            from .settings import load_settings
-
-            settings = load_settings()
-            api_key = (settings.api_key or "").strip()
-            if not api_key:
-                raise IFlowNotConfiguredError(
-                    "iFlow 未配置，请通过 WebUI 完成登录: http://localhost:28000/admin"
-                ) from e
-
-            oauth_expires_at = None
-            if settings.oauth_expires_at:
-                try:
-                    oauth_expires_at = datetime.fromisoformat(settings.oauth_expires_at)
-                except ValueError:
-                    logger.warning("oauth_expires_at 格式无效，忽略回退值: %s", settings.oauth_expires_at)
-
-            _config = IFlowConfig(
-                api_key=api_key,
-                base_url=(settings.base_url or "https://apis.iflow.cn/v1"),
-                auth_type=(settings.auth_type or None),
-                oauth_access_token=(settings.oauth_access_token or None),
-                oauth_refresh_token=(settings.oauth_refresh_token or None),
-                oauth_expires_at=oauth_expires_at,
-                api_key_expires_at=oauth_expires_at,
-                cookie=(settings.cookie or None),
-                cookie_email=(settings.cookie_email or None),
-                cookie_expires_at=settings.cookie_expires_at,
-            )
-            logger.info("iFlow CLI 配置不可用，已回退使用 iflow2api 应用配置")
+            raise IFlowNotConfiguredError(
+                "iFlow 未配置，请通过 WebUI 完成登录: http://localhost:28000/admin"
+            ) from e
 
         _proxy = IFlowProxy(_config)
     return _proxy
 
 
 def update_proxy_token(token_data: dict):
-    """Token 刷新回调，刷新兼容层缓存。"""
+    """Token 刷新回调，刷新运行时缓存。"""
     account_id = token_data.get("account_id")
     auth_type = token_data.get("auth_type") or "unknown"
     logger.info("检测到账号凭据刷新: account_id=%s, auth_type=%s", account_id, auth_type)
@@ -644,7 +610,7 @@ async def lifespan(app: FastAPI):
     # 启动时打印版本和系统信息
     logger.info("%s", get_startup_info())
     
-    # 初始化设置与兼容并发信号量
+    # 初始化设置与并发信号量
     from .settings import get_enabled_upstream_accounts, load_settings
     settings = load_settings()
     enabled_accounts = get_enabled_upstream_accounts(settings)
@@ -657,13 +623,7 @@ async def lifespan(app: FastAPI):
         effective_concurrency,
     )
     
-    # 尝试加载 iFlow 配置（可选）
-    # 优先检查应用主配置 ~/.iflow2api/config.json（用户通过 WebUI 登录后保存）
-    # 其次检查 iFlow CLI 配置 ~/.iflow/settings.json
-    from pathlib import Path
-    app_config_path = Path.home() / ".iflow2api" / "config.json"
-    app_config_exists = app_config_path.exists()
-    
+    # 尝试加载当前主账号配置（可选）
     try:
         config = load_iflow_config()
         _config = config
@@ -674,15 +634,10 @@ async def lifespan(app: FastAPI):
             logger.info("默认模型: %s", config.model_name)
             
     except FileNotFoundError:
-        # 检查是否存在应用主配置（用户通过 WebUI 登录）
-        if app_config_exists:
-            logger.info("检测到应用配置文件，等待 WebUI 初始化...")
-            logger.info("访问 http://localhost:%d/admin 进入管理界面", settings.port)
-        else:
-            logger.warning("iFlow 配置文件不存在，请通过 WebUI 完成登录")
-            logger.warning("访问 http://localhost:%d/admin 进入管理界面", settings.port)
+        logger.warning("iflow2api 配置文件不存在，请通过 WebUI 完成登录")
+        logger.warning("访问 http://localhost:%d/admin 进入管理界面", settings.port)
     except ValueError as e:
-        logger.warning("iFlow 配置文件格式错误: %s", e)
+        logger.warning("iflow2api 配置无效: %s", e)
         logger.warning("请通过 WebUI 重新登录")
 
     # 启动 Token 刷新任务（无账号时也允许启动，后台会自行跳过）
@@ -707,9 +662,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="iflow2api",
     description="""
-## iflow2api - iFlow CLI AI 服务代理
+## iflow2api - iFlow AI 服务代理
 
-将 iFlow CLI 的 AI 服务暴露为 OpenAI 兼容 API，支持多种 AI 模型。
+将 iFlow 账号服务暴露为 OpenAI 兼容 API，支持多种 AI 模型。
 
 ### 功能特性
 
@@ -734,8 +689,8 @@ app = FastAPI(
 
 ### 使用方式
 
-1. 确保已安装并登录 iFlow CLI: `npm install -g @iflow-ai/iflow-cli && iflow login`
-2. 启动服务: `iflow2api` 或通过 GUI 启动
+1. 部署并启动 Docker 容器
+2. 访问 `/admin` 完成 API Key、OAuth 或 Cookie 登录
 3. 配置客户端使用 `http://localhost:28000/v1` 作为 API 端点
 """,
 version=get_version(),
@@ -989,7 +944,7 @@ async def root():
     return {
         "service": "iflow2api",
         "version": get_version(),
-        "description": "iFlow CLI AI 服务 → OpenAI 兼容 API",
+        "description": "iFlow AI 服务 → OpenAI 兼容 API",
         "endpoints": {
             "models": "/v1/models",
             "chat_completions": "/v1/chat/completions",
@@ -1815,24 +1770,23 @@ def main():
     from .settings import load_settings
     from .logging_setup import setup_file_logging
 
-    # 初始化文件日志（CLI 模式：日志同时写入文件和终端）
+    # 初始化文件日志
     setup_file_logging()
 
     # 解析命令行参数
     parser = argparse.ArgumentParser(
         prog='iflow2api',
-        description='iFlow CLI AI 服务代理 - OpenAI 兼容 API',
+        description='iFlow AI 服务代理 - OpenAI 兼容 API',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 示例:
-  iflow2api                    # 使用默认配置启动
-  iflow2api --port 28001       # 指定端口
-  iflow2api --host 0.0.0.0     # 监听所有网卡
-  iflow2api --version          # 显示版本信息
+  python -m iflow2api                    # 使用默认配置启动
+  python -m iflow2api --port 28001       # 指定端口
+  python -m iflow2api --host 0.0.0.0     # 监听所有网卡
+  python -m iflow2api --version          # 显示版本信息
 
 配置文件位置:
   ~/.iflow2api/config.json     # 应用配置
-  ~/.iflow/settings.json       # iFlow CLI 配置
 
 更多信息请访问: https://github.com/cacaview/iflow2api
         '''
@@ -1850,14 +1804,13 @@ def main():
     # 加载配置（需要在检查登录状态之前加载，以便获取端口信息）
     settings = load_settings()
 
-    # 检查是否已登录（Docker 环境下允许无配置启动，用户可通过 WebUI 登录）
+    # 未配置时允许继续启动，后续通过 WebUI 完成账号登录
     if not check_iflow_login():
         if is_docker():
             logger.warning("iFlow 未登录，请通过 WebUI 完成登录")
-            logger.warning("访问 http://localhost:%d/admin 进入管理界面", settings.port)
         else:
-            logger.error("iFlow 未登录，请先运行 'iflow' 命令并完成登录")
-            sys.exit(1)
+            logger.warning("尚未配置上游账号，请通过 WebUI 完成登录")
+        logger.warning("访问 http://localhost:%d/admin 进入管理界面", settings.port)
 
     # 命令行参数优先于配置文件
     host = args.host if args.host else settings.host
@@ -1883,7 +1836,7 @@ def main():
         # 端口冲突友好提示
         if "Address already in use" in str(e) or getattr(e, 'errno', None) in (48, 98, 10048):
             logger.error("端口 %d 已被占用", port)
-            logger.error("请使用 --port 指定其他端口，例如: iflow2api --port %d", port + 1)
+            logger.error("请使用 --port 指定其他端口，例如: python -m iflow2api --port %d", port + 1)
             logger.error("或修改配置文件 ~/.iflow2api/config.json 中的 port 字段")
         raise
 

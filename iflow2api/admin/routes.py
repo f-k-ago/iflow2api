@@ -1,6 +1,4 @@
 """Web 管理界面路由"""
-
-import asyncio
 import platform
 import sys
 import time
@@ -46,10 +44,6 @@ class SettingsUpdate(BaseModel):
     """设置更新请求"""
     host: Optional[str] = None
     port: Optional[int] = None
-    auto_start: Optional[bool] = None
-    start_minimized: Optional[bool] = None
-    close_action: Optional[str] = None  # 关闭按钮行为: exit, minimize_to_tray, minimize_to_taskbar
-    auto_run_server: Optional[bool] = None
     theme_mode: Optional[str] = None
     preserve_reasoning_content: Optional[bool] = None
     api_concurrency: Optional[int] = None
@@ -242,28 +236,14 @@ def _check_service_health(port: int, host: str = "127.0.0.1") -> tuple[bool, str
 async def get_status(username: str = Depends(get_current_user)) -> dict[str, Any]:
     """获取系统状态"""
     from ..settings import load_settings
-    
-    # 获取服务器管理器状态
-    server_manager = _get_server_manager()
-    manager_state = server_manager.state.value if server_manager else "stopped"
-    manager_error = server_manager.error_message if server_manager else ""
-    
+
     # 获取配置的端口
     settings = load_settings()
     configured_port = settings.port
-    
+
     # 实际检查服务健康状态
     is_healthy, health_error = _check_service_health(configured_port)
-    
-    # 确定最终状态
-    # 如果服务健康，则显示运行中，否则使用管理器状态
-    if is_healthy:
-        actual_state = "running"
-        actual_error = ""
-    else:
-        actual_state = manager_state if manager_state != "running" else "stopped"
-        actual_error = health_error or manager_error
-    
+
     # 获取系统信息
     system_info = {
         "platform": platform.system(),
@@ -283,9 +263,8 @@ async def get_status(username: str = Depends(get_current_user)) -> dict[str, Any
     
     return {
         "server": {
-            "state": actual_state,
-            "error_message": actual_error,
-            "manager_state": manager_state,  # 保留管理器状态供调试
+            "state": "running" if is_healthy else "error",
+            "error_message": "" if is_healthy else health_error,
             "configured_port": configured_port,
         },
         "system": system_info,
@@ -400,10 +379,6 @@ async def get_settings(username: str = Depends(get_current_user)) -> dict[str, A
     return {
         "host": settings.host,
         "port": settings.port,
-        "auto_start": settings.auto_start,
-        "start_minimized": settings.start_minimized,
-        "close_action": settings.close_action,
-        "auto_run_server": settings.auto_run_server,
         "theme_mode": settings.theme_mode,
         "preserve_reasoning_content": settings.preserve_reasoning_content,
         "api_concurrency": settings.api_concurrency,
@@ -435,17 +410,6 @@ async def update_settings(
         settings.host = request.host
     if request.port is not None:
         settings.port = request.port
-    if request.auto_start is not None:
-        settings.auto_start = request.auto_start
-        # 同时设置系统自启动
-        from ..settings import set_auto_start
-        set_auto_start(request.auto_start)
-    if request.start_minimized is not None:
-        settings.start_minimized = request.start_minimized
-    if request.close_action is not None:
-        settings.close_action = request.close_action
-    if request.auto_run_server is not None:
-        settings.auto_run_server = request.auto_run_server
     if request.theme_mode is not None:
         settings.theme_mode = request.theme_mode
     if request.preserve_reasoning_content is not None:
@@ -576,7 +540,7 @@ async def activate_upstream_account(
     account_id: str,
     username: str = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """切换兼容层主账号。"""
+    """切换当前主账号。"""
     from ..settings import build_legacy_account, load_settings, save_settings
 
     settings = load_settings()
@@ -632,49 +596,6 @@ async def delete_upstream_account(
 
     reload_proxy()
     return {"success": True, "message": "账号已删除"}
-
-@admin_router.post("/import-from-cli")
-async def import_from_cli(
-    username: str = Depends(get_current_user),
-) -> dict[str, Any]:
-    """从 iFlow CLI 导入配置"""
-    from ..settings import UpstreamAccount, import_from_iflow_cli, load_settings, save_settings, upsert_upstream_account
-    
-    config = import_from_iflow_cli()
-    if config:
-        settings = load_settings()
-        account = UpstreamAccount(
-            label="iFlow CLI 导入",
-            auth_type=(config.auth_type or "api-key"),
-            api_key=config.api_key,
-            base_url=config.base_url,
-            oauth_access_token=config.oauth_access_token or "",
-            oauth_refresh_token=config.oauth_refresh_token or "",
-            oauth_expires_at=config.oauth_expires_at.isoformat() if config.oauth_expires_at else None,
-            cookie=config.cookie or "",
-            cookie_email=config.cookie_email or "",
-            cookie_expires_at=config.cookie_expires_at,
-            email=config.cookie_email or "",
-        )
-        saved_account = upsert_upstream_account(settings, account, make_primary=not settings.primary_account_id)
-        save_settings(settings)
-
-        from ..app import reload_proxy
-
-        reload_proxy()
-        return {
-            "success": True,
-            "message": "已从 iFlow CLI 导入到账号池",
-            "api_key": config.api_key,
-            "base_url": config.base_url,
-            "account": _serialize_upstream_account(saved_account, primary_account_id=settings.primary_account_id),
-        }
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="无法导入 iFlow CLI 配置，请确保已运行 iflow 并完成登录"
-        )
-
 
 @admin_router.get("/oauth/url")
 async def get_oauth_url(
@@ -910,67 +831,6 @@ async def oauth_callback(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"OAuth 登录失败: {str(e)}")
 
-
-# ==================== 服务器控制 ====================
-
-@admin_router.post("/server/start")
-async def start_server(username: str = Depends(get_current_user)) -> dict[str, Any]:
-    """启动服务器"""
-    from ..settings import load_settings
-    
-    server_manager = _get_server_manager()
-    if server_manager is None:
-        raise HTTPException(status_code=500, detail="服务器管理器未初始化")
-    
-    settings = load_settings()
-    success = server_manager.start(settings)
-    
-    if not success:
-        raise HTTPException(status_code=400, detail=server_manager.error_message or "启动失败")
-    
-    return {"success": True, "message": "服务器已启动"}
-
-
-@admin_router.post("/server/stop")
-async def stop_server(username: str = Depends(get_current_user)) -> dict[str, Any]:
-    """停止服务器"""
-    server_manager = _get_server_manager()
-    if server_manager is None:
-        raise HTTPException(status_code=500, detail="服务器管理器未初始化")
-    
-    success = server_manager.stop()
-    
-    if not success:
-        raise HTTPException(status_code=400, detail="停止失败")
-    
-    return {"success": True, "message": "服务器已停止"}
-
-
-@admin_router.post("/server/restart")
-async def restart_server(username: str = Depends(get_current_user)) -> dict[str, Any]:
-    """重启服务器"""
-    from ..settings import load_settings
-    
-    server_manager = _get_server_manager()
-    if server_manager is None:
-        raise HTTPException(status_code=500, detail="服务器管理器未初始化")
-    
-    # 先停止
-    server_manager.stop()
-    
-    # 等待停止完成
-    await asyncio.sleep(1)
-    
-    # 重新启动
-    settings = load_settings()
-    success = server_manager.start(settings)
-    
-    if not success:
-        raise HTTPException(status_code=400, detail=server_manager.error_message or "重启失败")
-    
-    return {"success": True, "message": "服务器已重启"}
-
-
 # ==================== 日志查看 ====================
 
 @admin_router.get("/logs")
@@ -1048,18 +908,3 @@ _process_start_time = time.time()
 def _get_process_start_time() -> str:
     """获取进程启动时间"""
     return datetime.fromtimestamp(_process_start_time).isoformat()
-
-
-# 服务器管理器引用
-_server_manager: Optional[Any] = None
-
-
-def set_server_manager(manager: Any) -> None:
-    """设置服务器管理器引用"""
-    global _server_manager
-    _server_manager = manager
-
-
-def _get_server_manager() -> Optional[Any]:
-    """获取服务器管理器引用"""
-    return _server_manager

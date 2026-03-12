@@ -1,7 +1,7 @@
 [project]
 name = "iflow2api"
 version = "1.6.10"
-description = "将 iFlow CLI 的 AI 服务暴露为 OpenAI 兼容 API"
+description = "将 iFlow 账号服务暴露为 OpenAI 兼容 API"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -28,10 +28,6 @@ dependencies = [
     "curl_cffi>=0.7.3",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
-    "flet>=0.25.0",
-    # P0: 系统托盘
-    "pystray>=0.19.0",
-    "Pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]
@@ -43,18 +39,11 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=4.0.0",
 ]
-build = [
-    "pyinstaller>=6.0.0",
-]
 
 [project.urls]
 Homepage = "https://github.com/cacaview/iflow2api"
 Repository = "https://github.com/cacaview/iflow2api"
 Issues = "https://github.com/cacaview/iflow2api/issues"
-
-[project.scripts]
-iflow2api = "iflow2api.main:main"
-iflow2api-gui = "iflow2api.gui:main"
 
 [build-system]
 requires = ["hatchling"]

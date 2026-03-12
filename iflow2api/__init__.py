@@ -1,3 +1,3 @@
-"""iflow2api - 将 iFlow CLI 的 AI 服务暴露为 OpenAI 兼容 API"""
+"""iflow2api - 将 iFlow 账号服务暴露为 OpenAI 兼容 API"""
 
 __version__ = "1.6.10"

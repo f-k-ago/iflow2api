@@ -360,19 +360,11 @@ async function loadStatus() {
         statusBadge.textContent = {
             stopped: '已停止',
             running: '运行中',
-            starting: '启动中',
-            stopping: '停止中',
-            error: '错误',
+            error: '异常',
         }[data.server.state] || data.server.state;
 
         // 更新错误消息
         document.getElementById('server-error').textContent = data.server.error_message || '';
-
-        // 更新按钮状态
-        const isRunning = data.server.state === 'running';
-        document.getElementById('start-server-btn').disabled = isRunning;
-        document.getElementById('stop-server-btn').disabled = !isRunning;
-        document.getElementById('restart-server-btn').disabled = !isRunning;
 
         // 更新运行时间
         document.getElementById('uptime').textContent = formatUptime(data.process.uptime);
@@ -425,13 +417,7 @@ async function loadSettings() {
         // 填充服务器配置
         document.getElementById('setting-host').value = data.host || '';
         document.getElementById('setting-port').value = data.port || 28000;
-        
-        // 填充启动设置
-        document.getElementById('setting-auto-start').checked = data.auto_start || false;
-        document.getElementById('setting-start-minimized').checked = data.start_minimized || false;
-        document.getElementById('setting-minimize-to-tray').checked = data.close_action === 'minimize_to_tray';
-        document.getElementById('setting-auto-run-server').checked = data.auto_run_server || false;
-        
+
         // 填充界面设置
         document.getElementById('setting-theme').value = data.theme_mode || 'system';
         document.getElementById('setting-language').value = data.language || 'zh';
@@ -460,16 +446,11 @@ async function loadSettings() {
  */
 async function saveSettings() {
     const settings = {
-        // 兼容层默认 Base URL
+        // 当前主账号默认 Base URL
         base_url: document.getElementById('setting-base-url').value,
         // 服务器配置
         host: document.getElementById('setting-host').value,
         port: parseInt(document.getElementById('setting-port').value),
-        // 启动设置
-        auto_start: document.getElementById('setting-auto-start').checked,
-        start_minimized: document.getElementById('setting-start-minimized').checked,
-        close_action: document.getElementById('setting-minimize-to-tray').checked ? 'minimize_to_tray' : 'exit',
-        auto_run_server: document.getElementById('setting-auto-run-server').checked,
         // 界面设置
         theme_mode: document.getElementById('setting-theme').value,
         language: document.getElementById('setting-language').value,
@@ -491,21 +472,6 @@ async function saveSettings() {
             body: JSON.stringify(settings),
         });
         showToast('设置已保存', 'success');
-    } catch (error) {
-        showToast(error.message, 'error');
-    }
-}
-
-/**
- * 从 iFlow CLI 导入配置
- */
-async function importFromCli() {
-    try {
-        const data = await apiRequest('/import-from-cli', { method: 'POST' });
-        showToast(data.message, 'success');
-        document.getElementById('setting-api-key').value = '';
-        document.getElementById('setting-base-url').value = data.base_url || '';
-        loadAccountInfo();
     } catch (error) {
         showToast(error.message, 'error');
     }
@@ -800,38 +766,6 @@ async function loadLogs() {
     }
 }
 
-// ==================== 服务器控制 ====================
-
-async function startServer() {
-    try {
-        await apiRequest('/server/start', { method: 'POST' });
-        showToast('服务器已启动', 'success');
-        loadStatus();
-    } catch (error) {
-        showToast(error.message, 'error');
-    }
-}
-
-async function stopServer() {
-    try {
-        await apiRequest('/server/stop', { method: 'POST' });
-        showToast('服务器已停止', 'success');
-        loadStatus();
-    } catch (error) {
-        showToast(error.message, 'error');
-    }
-}
-
-async function restartServer() {
-    try {
-        await apiRequest('/server/restart', { method: 'POST' });
-        showToast('服务器已重启', 'success');
-        loadStatus();
-    } catch (error) {
-        showToast(error.message, 'error');
-    }
-}
-
 // ==================== WebSocket ====================
 
 function connectWebSocket() {
@@ -929,18 +863,12 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
-    // 服务器控制按钮
-    document.getElementById('start-server-btn').addEventListener('click', startServer);
-    document.getElementById('stop-server-btn').addEventListener('click', stopServer);
-    document.getElementById('restart-server-btn').addEventListener('click', restartServer);
-
     // 设置保存
     document.getElementById('save-settings-btn').addEventListener('click', saveSettings);
     document.getElementById('reset-settings-btn').addEventListener('click', loadSettings);
 
     // iFlow 配置按钮
     document.getElementById('add-api-account-btn').addEventListener('click', createApiKeyAccount);
-    document.getElementById('import-cli-btn').addEventListener('click', importFromCli);
     document.getElementById('oauth-login-btn').addEventListener('click', oauthLogin);
     document.getElementById('cookie-login-btn').addEventListener('click', openCookieModal);
     // Cookie 登录模态框

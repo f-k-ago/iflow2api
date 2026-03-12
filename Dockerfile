@@ -52,8 +52,6 @@ USER appuser
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
-ENV HOST=0.0.0.0
-ENV PORT=28000
 
 # 暴露端口
 EXPOSE 28000
@@ -63,4 +61,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:28000/health || exit 1
 
 # 启动命令
-CMD ["python", "-m", "iflow2api.main"]
+CMD ["python", "-m", "iflow2api"]

@@ -89,11 +89,6 @@
                                 <div id="server-status" class="status-badge stopped">已停止</div>
                                 <p id="server-error" class="error-message"></p>
                             </div>
-                            <div class="card-footer">
-                                <button id="start-server-btn" class="btn btn-success">启动</button>
-                                <button id="stop-server-btn" class="btn btn-danger" disabled>停止</button>
-                                <button id="restart-server-btn" class="btn btn-warning" disabled>重启</button>
-                            </div>
                         </div>
 
                         <div class="card">
@@ -245,11 +240,10 @@
                                 </div>
                                 <div class="form-row">
                                     <button type="button" id="add-api-account-btn" class="btn btn-primary">添加 API Key 账号</button>
-                                    <button type="button" id="import-cli-btn" class="btn btn-secondary">从 iFlow CLI 导入</button>
                                     <button type="button" id="oauth-login-btn" class="btn btn-secondary">OAuth 登录</button>
                                     <button type="button" id="cookie-login-btn" class="btn btn-secondary">Cookie 登录</button>
                                 </div>
-                                <p class="hint">这里的 API Key 表单只用于新增账号，不会在“保存设置”时覆盖现有账号。OAuth、Cookie、CLI 导入都会直接写入账号池。</p>
+                                <p class="hint">这里的 API Key 表单只用于新增账号，不会在“保存设置”时覆盖现有账号。OAuth 和 Cookie 登录也会直接写入账号池。</p>
                                 <div class="form-group" style="margin-top: 20px;">
                                     <label>已配置账号</label>
                                     <table class="info-table" id="upstream-accounts-table">
@@ -283,33 +277,6 @@
                                 <div class="form-group">
                                     <label for="setting-port">端口</label>
                                     <input type="number" id="setting-port" name="port" min="1" max="65535">
-                                </div>
-                            </form>
-                        </div>
-                    </div>
-
-                    <div class="card">
-                        <div class="card-header">
-                            <span class="icon">🚀</span>
-                            <span>启动设置</span>
-                        </div>
-                        <div class="card-body">
-                            <form id="startup-settings-form">
-                                <div class="form-group checkbox">
-                                    <input type="checkbox" id="setting-auto-start" name="auto_start">
-                                    <label for="setting-auto-start">开机自启动</label>
-                                </div>
-                                <div class="form-group checkbox">
-                                    <input type="checkbox" id="setting-start-minimized" name="start_minimized">
-                                    <label for="setting-start-minimized">启动时最小化</label>
-                                </div>
-                                <div class="form-group checkbox">
-                                    <input type="checkbox" id="setting-minimize-to-tray" name="minimize_to_tray">
-                                    <label for="setting-minimize-to-tray">关闭时最小化到托盘</label>
-                                </div>
-                                <div class="form-group checkbox">
-                                    <input type="checkbox" id="setting-auto-run-server" name="auto_run_server">
-                                    <label for="setting-auto-run-server">启动时自动运行服务</label>
                                 </div>
                             </form>
                         </div>

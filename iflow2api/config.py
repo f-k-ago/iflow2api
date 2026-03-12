@@ -1,250 +1,164 @@
-"""iFlow 配置读取器 - 从 ~/.iflow/settings.json 读取认证信息"""
+"""iflow2api 运行时配置读取器。"""
 
 import json
 import logging
-from pathlib import Path
-from typing import Optional
-from pydantic import BaseModel, Field
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
+
+from .crypto import ConfigEncryption
 
 logger = logging.getLogger("iflow2api")
 
+DEFAULT_BASE_URL = "https://apis.iflow.cn/v1"
+
 
 class IFlowConfig(BaseModel):
-    """iFlow 配置"""
+    """运行时使用的上游配置。"""
 
     api_key: str
-    base_url: str = "https://apis.iflow.cn/v1"
+    base_url: str = DEFAULT_BASE_URL
     model_name: Optional[str] = None
     cna: Optional[str] = None
     installation_id: Optional[str] = None
-    # OAuth 相关字段
     auth_type: Optional[str] = Field(
-        default=None, description="认证类型: oauth-iflow, cookie, api-key, openai-compatible"
+        default=None,
+        description="认证类型: oauth-iflow, cookie, api-key, openai-compatible",
     )
-    oauth_access_token: Optional[str] = Field(
-        default=None, description="OAuth 访问令牌"
-    )
-    oauth_refresh_token: Optional[str] = Field(
-        default=None, description="OAuth 刷新令牌"
-    )
-    oauth_expires_at: Optional[datetime] = Field(
-        default=None, description="OAuth token 过期时间"
-    )
-    # apiKey 过期时间（与 oauth_expires_at 相同，用于清晰语义）
+    oauth_access_token: Optional[str] = Field(default=None, description="OAuth 访问令牌")
+    oauth_refresh_token: Optional[str] = Field(default=None, description="OAuth 刷新令牌")
+    oauth_expires_at: Optional[datetime] = Field(default=None, description="OAuth token 过期时间")
     api_key_expires_at: Optional[datetime] = Field(
-        default=None, description="apiKey 过期时间（OAuth 模式下与 token 同步）"
+        default=None,
+        description="apiKey 过期时间（OAuth 模式下与 token 同步）",
     )
-    # Cookie 相关字段
-    cookie: Optional[str] = Field(
-        default=None, description="Cookie 登录凭据（仅 BXAuth）"
-    )
-    cookie_email: Optional[str] = Field(
-        default=None, description="Cookie 登录绑定邮箱"
-    )
+    cookie: Optional[str] = Field(default=None, description="Cookie 登录凭据（仅 BXAuth）")
+    cookie_email: Optional[str] = Field(default=None, description="Cookie 登录绑定邮箱")
     cookie_expires_at: Optional[str] = Field(
-        default=None, description="Cookie 模式下 apiKey 过期时间（原始字符串）"
+        default=None,
+        description="Cookie 模式下 apiKey 过期时间（原始字符串）",
     )
 
 
-def get_iflow_config_path() -> Path:
-    """获取 iFlow 配置文件路径"""
-    # Windows: C:\Users\<user>\.iflow\settings.json
-    # Linux/Mac: ~/.iflow/settings.json
-    home = Path.home()
-    return home / ".iflow" / "settings.json"
+def get_app_config_path() -> Path:
+    """获取应用配置文件路径。"""
+    return Path.home() / ".iflow2api" / "config.json"
 
 
-def get_installation_id_path() -> Path:
-    """获取 installation_id 文件路径"""
-    home = Path.home()
-    return home / ".iflow" / "installation_id"
+def _decrypt_token(value: Any) -> str:
+    """解密 enc: 前缀的敏感字段。"""
+    if not isinstance(value, str) or not value:
+        return ""
+    if not value.startswith("enc:"):
+        return value
 
-
-def _decrypt_sensitive_fields(data: dict) -> dict:
-    """解密配置中的敏感字段
-    
-    Args:
-        data: 原始配置字典
-        
-    Returns:
-        解密后的配置字典
-    """
-    from .crypto import ConfigEncryption
-    
     encryption = ConfigEncryption()
-    if encryption.is_available:
-        return encryption.decrypt_dict(data)
-    return data
+    if not encryption.is_available:
+        return value
+
+    try:
+        return encryption.decrypt(value[4:])
+    except ValueError:
+        logger.warning("配置字段解密失败，将保留原始值")
+        return value
+
+
+def _parse_datetime(value: Any) -> Optional[datetime]:
+    """解析 ISO 时间字符串。"""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _select_primary_account(data: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """从账号池中选出当前主账号。"""
+    raw_accounts = data.get("upstream_accounts")
+    if not isinstance(raw_accounts, list) or not raw_accounts:
+        return None
+
+    accounts = [account for account in raw_accounts if isinstance(account, dict)]
+    if not accounts:
+        return None
+
+    primary_account_id = (data.get("primary_account_id") or "").strip()
+    accounts_by_id = {
+        str(account.get("id") or "").strip(): account
+        for account in accounts
+        if str(account.get("id") or "").strip()
+    }
+
+    if primary_account_id and primary_account_id in accounts_by_id:
+        return accounts_by_id[primary_account_id]
+
+    for account in accounts:
+        if account.get("enabled", True) and str(account.get("api_key") or "").strip():
+            return account
+
+    for account in accounts:
+        if str(account.get("api_key") or "").strip():
+            return account
+
+    return accounts[0]
+
+
+def _build_config_from_mapping(raw: dict[str, Any]) -> IFlowConfig:
+    """把配置字典转换为 IFlowConfig。"""
+    oauth_expires_at = _parse_datetime(raw.get("oauth_expires_at"))
+
+    api_key = (
+        str(raw.get("api_key") or raw.get("apiKey") or raw.get("searchApiKey") or "")
+        .strip()
+    )
+    base_url = str(raw.get("base_url") or raw.get("baseUrl") or DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
+
+    return IFlowConfig(
+        api_key=api_key,
+        base_url=base_url,
+        model_name=(raw.get("model_name") or raw.get("modelName") or None),
+        cna=(raw.get("cna") or None),
+        installation_id=None,
+        auth_type=(raw.get("auth_type") or raw.get("selectedAuthType") or None),
+        oauth_access_token=_decrypt_token(raw.get("oauth_access_token")) or None,
+        oauth_refresh_token=_decrypt_token(raw.get("oauth_refresh_token")) or None,
+        oauth_expires_at=oauth_expires_at,
+        api_key_expires_at=oauth_expires_at,
+        cookie=_decrypt_token(raw.get("cookie")) or None,
+        cookie_email=(raw.get("cookie_email") or None),
+        cookie_expires_at=(raw.get("cookie_expires_at") or None),
+    )
 
 
 def load_iflow_config() -> IFlowConfig:
-    """
-    从 iFlow CLI 配置文件加载认证信息
-
-    Returns:
-        IFlowConfig: 包含 API Key 和 Base URL 的配置对象
-
-    Raises:
-        FileNotFoundError: 配置文件不存在
-        ValueError: 配置文件格式错误或缺少必要字段
-    """
-    config_path = get_iflow_config_path()
-
+    """从 `~/.iflow2api/config.json` 加载运行时主账号。"""
+    config_path = get_app_config_path()
     if not config_path.exists():
         raise FileNotFoundError(
-            f"iFlow 配置文件不存在: {config_path}\n请先运行 iflow 命令并完成登录"
+            f"iflow2api 配置文件不存在: {config_path}\n请先通过 WebUI 完成登录"
         )
 
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
-        raise ValueError(f"iFlow 配置文件格式错误: {e}")
+        raise ValueError(f"iflow2api 配置文件格式错误: {e}") from e
 
-    # 解密敏感字段（如 oauth_refresh_token）
-    data = _decrypt_sensitive_fields(data)
+    config_data = _select_primary_account(data) or data
+    config = _build_config_from_mapping(config_data)
 
-    # 检查认证类型
-    auth_type = data.get("selectedAuthType", "")
-    if auth_type not in ("oauth-iflow", "cookie", "api-key"):
-        # 也支持 openai-compatible 模式，但会给出警告
-        if auth_type == "openai-compatible":
-            logger.warning("当前使用 openai-compatible 模式，部分模型可能不可用")
-        elif auth_type:
-            logger.warning("未知的认证类型: %s", auth_type)
+    if not config.api_key:
+        raise ValueError("iflow2api 配置中缺少 API Key\n请先通过 WebUI 完成登录")
 
-    # 获取 API Key
-    api_key = data.get("apiKey") or data.get("searchApiKey")
-    if not api_key:
-        raise ValueError("iFlow 配置中缺少 API Key\n请先运行 iflow 命令并完成登录")
-
-    # 获取 Base URL
-    base_url = data.get("baseUrl", "https://apis.iflow.cn/v1")
-
-    # 获取其他可选配置
-    model_name = data.get("modelName")
-    cna = data.get("cna")
-
-    # 解析 OAuth token 过期时间
-    oauth_expires_at = None
-    expires_at_str = data.get("oauth_expires_at")
-    if expires_at_str:
-        try:
-            oauth_expires_at = datetime.fromisoformat(expires_at_str)
-        except (ValueError, TypeError):
-            pass
-
-    # 尝试读取 installation_id
-    installation_id = None
-    installation_id_path = get_installation_id_path()
-    if installation_id_path.exists():
-        try:
-            installation_id = installation_id_path.read_text(encoding="utf-8").strip()
-        except Exception:
-            pass
-
-    # apiKey 过期时间（OAuth 模式下与 oauth_expires_at 相同）
-    api_key_expires_at = oauth_expires_at
-
-    return IFlowConfig(
-        api_key=api_key,
-        base_url=base_url,
-        model_name=model_name,
-        cna=cna,
-        installation_id=installation_id,
-        auth_type=auth_type,
-        oauth_access_token=data.get("oauth_access_token"),
-        oauth_refresh_token=data.get("oauth_refresh_token"),
-        oauth_expires_at=oauth_expires_at,
-        api_key_expires_at=api_key_expires_at,
-        cookie=data.get("cookie"),
-        cookie_email=data.get("cookie_email"),
-        cookie_expires_at=data.get("cookie_expires_at"),
-    )
+    return config
 
 
 def check_iflow_login() -> bool:
-    """检查 iFlow 是否已登录
-    
-    检查顺序：
-    1. 先检查 ~/.iflow2api/config.json（应用主配置）
-    2. 再检查 ~/.iflow/settings.json（iFlow CLI 配置）
-    """
-    # 首先检查应用主配置
-    from pathlib import Path
-    app_config_path = Path.home() / ".iflow2api" / "config.json"
-    if app_config_path.exists():
-        try:
-            import json
-            with open(app_config_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if data.get("api_key"):
-                return True
-        except Exception:
-            pass
-    
-    # 再检查 iFlow CLI 配置
+    """检查 iflow2api 是否已配置上游账号。"""
     try:
-        config = load_iflow_config()
-        return bool(config.api_key)
+        return bool(load_iflow_config().api_key)
     except (FileNotFoundError, ValueError):
         return False
-
-
-def save_iflow_config(config: IFlowConfig) -> None:
-    """
-    保存 iFlow 配置到 ~/.iflow/settings.json
-
-    仅更新已知字段，保留文件中原有的未知字段（M-03 修复）
-
-    Args:
-        config: IFlowConfig 配置对象
-    """
-    config_path = get_iflow_config_path()
-    config_dir = config_path.parent
-    config_dir.mkdir(parents=True, exist_ok=True)
-
-    # 先读取现有数据，保留未知字段（M-03 修复）
-    existing_data: dict = {}
-    if config_path.exists():
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                existing_data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            existing_data = {}
-
-    # 仅覆盖已知字段
-    existing_data["apiKey"] = config.api_key
-    existing_data["baseUrl"] = config.base_url
-
-    if config.model_name is not None:
-        existing_data["modelName"] = config.model_name
-    if config.cna is not None:
-        existing_data["cna"] = config.cna
-    if config.auth_type is not None:
-        existing_data["selectedAuthType"] = config.auth_type
-    if config.oauth_access_token is not None:
-        existing_data["oauth_access_token"] = config.oauth_access_token
-    if config.oauth_refresh_token is not None:
-        existing_data["oauth_refresh_token"] = config.oauth_refresh_token
-    if config.oauth_expires_at is not None:
-        existing_data["oauth_expires_at"] = config.oauth_expires_at.isoformat()
-    else:
-        existing_data.pop("oauth_expires_at", None)
-    if config.api_key_expires_at is not None:
-        existing_data["api_key_expires_at"] = config.api_key_expires_at.isoformat()
-    else:
-        existing_data.pop("api_key_expires_at", None)
-    if config.cookie is not None:
-        existing_data["cookie"] = config.cookie
-    if config.cookie_email is not None:
-        existing_data["cookie_email"] = config.cookie_email
-    if config.cookie_expires_at is not None:
-        existing_data["cookie_expires_at"] = config.cookie_expires_at
-    else:
-        existing_data.pop("cookie_expires_at", None)
-
-    # 保存到文件
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(existing_data, f, indent=2, ensure_ascii=False)
