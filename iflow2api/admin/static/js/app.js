@@ -392,6 +392,83 @@ async function importFromCli() {
 }
 
 /**
+ * Cookie 登录
+ */
+async function cookieLogin() {
+    const cookieInput = document.getElementById('cookie-input');
+    const cookieEmail = document.getElementById('cookie-email');
+    const cookieStatus = document.getElementById('cookie-status');
+    const cookieSubmitBtn = document.getElementById('cookie-submit-btn');
+
+    const cookie = cookieInput.value.trim();
+    const email = cookieEmail.value.trim();
+
+    if (!cookie) {
+        cookieStatus.textContent = '请输入 Cookie';
+        cookieStatus.style.color = 'red';
+        return;
+    }
+
+    if (!email) {
+        cookieStatus.textContent = '请输入邮箱地址';
+        cookieStatus.style.color = 'red';
+        return;
+    }
+
+    if (!cookie.includes('BXAuth=')) {
+        cookieStatus.textContent = 'Cookie 必须包含 BXAuth 字段';
+        cookieStatus.style.color = 'red';
+        return;
+    }
+
+    cookieStatus.textContent = '正在登录...';
+    cookieStatus.style.color = 'blue';
+    cookieSubmitBtn.disabled = true;
+
+    try {
+        const result = await apiRequest('/cookie/login', {
+            method: 'POST',
+            body: JSON.stringify({ cookie, email })
+        });
+
+        if (result.success) {
+            showToast('Cookie 登录成功！', 'success');
+            cookieInput.value = '';
+            cookieEmail.value = '';
+            cookieStatus.textContent = '';
+            closeCookieModal();
+            loadSettings();
+        } else {
+            cookieStatus.textContent = `登录失败: ${result.message}`;
+            cookieStatus.style.color = 'red';
+        }
+    } catch (error) {
+        cookieStatus.textContent = `登录失败: ${error.message}`;
+        cookieStatus.style.color = 'red';
+    } finally {
+        cookieSubmitBtn.disabled = false;
+    }
+}
+
+/**
+ * 打开 Cookie 登录模态框
+ */
+function openCookieModal() {
+    const modal = document.getElementById('cookie-modal');
+    modal.classList.add('active');
+}
+
+/**
+ * 关闭 Cookie 登录模态框
+ */
+function closeCookieModal() {
+    const modal = document.getElementById('cookie-modal');
+    modal.classList.remove('active');
+    document.getElementById('cookie-input').value = '';
+    document.getElementById('cookie-email').value = '';document.getElementById('cookie-status').textContent = '';
+}
+
+/**
  * OAuth 登录
  */
 let _oauthMessageHandler = null;
@@ -680,6 +757,9 @@ document.addEventListener('DOMContentLoaded', () => {
     // iFlow 配置按钮
     document.getElementById('import-cli-btn').addEventListener('click', importFromCli);
     document.getElementById('oauth-login-btn').addEventListener('click', oauthLogin);
+    document.getElementById('cookie-login-btn').addEventListener('click', openCookieModal);
+    // Cookie 登录模态框
+    document.getElementById('cookie-submit-btn').addEventListener('click', cookieLogin);
 
     // 添加用户表单
     document.getElementById('add-user-form').addEventListener('submit', (e) => {

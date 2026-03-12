@@ -188,7 +188,8 @@
                                 </div>
                                 <div class="form-row">
                                     <button type="button" id="import-cli-btn" class="btn btn-secondary">从 iFlow CLI 导入</button>
-                                    <button type="button" id="oauth-login-btn" class="btn btn-primary">OAuth 登录</button>                    <button type="button" id="cookie-login-btn" class="btn btn-secondary">Cookie 登录</button>
+                                    <button type="button" id="oauth-login-btn" class="btn btn-primary">OAuth 登录</button>
+                                    <button type="button" id="cookie-login-btn" class="btn btn-secondary">Cookie 登录</button>
                                 </div>
                             </form>
                         </div>
@@ -437,6 +438,32 @@
 
     <!-- Toast 通知 -->
     <div id="toast-container"></div>
+
+    <!-- Cookie 登录模态框 -->
+    <div id="cookie-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Cookie 登录</h2>
+                <button class="modal-close" onclick="closeCookieModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="cookie-input">BXAuth Cookie</label>
+                    <textarea id="cookie-input" rows="3" placeholder="粘贴完整的 Cookie 字符串（必须包含 BXAuth=xxx）"></textarea>
+                    <p class="hint">从浏览器开发者工具中复制 Cookie，必须包含 BXAuth 字段</p>
+                </div>
+                <div class="form-group">
+                    <label for="cookie-email">邮箱地址</label>
+                    <input type="email" id="cookie-email" placeholder="输入您的邮箱地址">
+                </div>
+                <p id="cookie-status" class="hint"></p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeCookieModal()">取消</button>
+                <button type="button" id="cookie-submit-btn" class="btn btn-primary">登录</button>
+            </div>
+        </div>
+    </div>
 
     <script src="/admin/static/js/app.js">// Cookie 登录处理
         const cookieSubmitBtn = document.getElementById('cookie-submit-btn');
