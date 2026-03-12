@@ -20,7 +20,7 @@ logger = logging.getLogger("iflow2api")
 
 # iFlow CLI 特殊 User-Agent，用于解锁更多模型
 IFLOW_CLI_USER_AGENT = "iFlow-Cli"
-IFLOW_CLI_VERSION = "0.5.13"
+IFLOW_CLI_VERSION = "0.5.17"  # 与官方反混淆版本保持一致
 
 MMSTAT_GM_BASE = "https://gm.mmstat.com"
 MMSTAT_VGIF_URL = "https://log.mmstat.com/v.gif"
@@ -523,14 +523,11 @@ class IFlowProxy:
         
         注意：所有模型都支持图像输入，由上游 API 决定如何处理。
         """
-        # iFlow CLI 支持的模型列表 (来源: iflow-cli SUPPORTED_MODELS)
-        # https://github.com/iflow-ai/iflow-cli/blob/main/src/models.ts
-        # 2026.2.15 更新
+        # iFlow CLI 支持的模型列表 (来源: uniflow_round2 反混淆代码)
+        # 与官方客户端 0.5.17 版本完全一致，避免被检测
+        # 2026.3.12 更新
         models = [
-            # 文本模型
-            {"id": "glm-4.6", "name": "GLM-4.6", "description": "智谱 GLM-4.6"},
             {"id": "glm-4.7", "name": "GLM-4.7", "description": "智谱 GLM-4.7"},
-            {"id": "glm-5", "name": "GLM-5", "description": "智谱 GLM-5 (推荐)"},
             {
                 "id": "iFlow-ROME-30BA3B",
                 "name": "iFlow-ROME-30BA3B",
@@ -541,20 +538,21 @@ class IFlowProxy:
                 "name": "DeepSeek-V3.2",
                 "description": "DeepSeek V3.2 对话模型",
             },
+            {"id": "glm-5", "name": "GLM-5", "description": "智谱 GLM-5 (推荐)"},
             {
                 "id": "qwen3-coder-plus",
                 "name": "Qwen3-Coder-Plus",
                 "description": "通义千问 Qwen3 Coder Plus",
             },
             {
-                "id": "kimi-k2",
-                "name": "Kimi-K2",
-                "description": "Moonshot Kimi K2",
-            },
-            {
                 "id": "kimi-k2-thinking",
                 "name": "Kimi-K2-Thinking",
                 "description": "Moonshot Kimi K2 思考模型",
+            },
+            {
+                "id": "minimax-m2.5",
+                "name": "MiniMax-M2.5",
+                "description": "MiniMax M2.5",
             },
             {
                 "id": "kimi-k2.5",
@@ -566,13 +564,6 @@ class IFlowProxy:
                 "name": "Kimi-K2-0905",
                 "description": "Moonshot Kimi K2 0905",
             },
-            {
-                "id": "minimax-m2.5",
-                "name": "MiniMax-M2.5",
-                "description": "MiniMax M2.5",
-            },
-            # 视觉模型（推荐用于图像处理）
-            {"id": "qwen-vl-max", "name": "Qwen-VL-Max", "description": "通义千问 VL Max 视觉模型"},
         ]
 
         import time
