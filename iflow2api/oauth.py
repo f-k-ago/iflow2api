@@ -120,8 +120,7 @@ class IFlowOAuth:
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
                 "Authorization": f"Basic {credentials}",
-                "User-Agent": "iFlow-Cli",
-            },
+                            },
             timeout=30.0,
         )
 
@@ -174,8 +173,7 @@ class IFlowOAuth:
             f"{self.USER_INFO_URL}?accessToken={access_token}",
             headers={
                 "Accept": "application/json",
-                "User-Agent": "iFlow-Cli",
-            },
+                            },
             timeout=30.0,
         )
 
