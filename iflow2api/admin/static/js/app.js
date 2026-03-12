@@ -384,24 +384,6 @@ async function loadStatus() {
 }
 
 /**
- * 加载性能指标
- */
-async function loadMetrics() {
-    try {
-        const data = await apiRequest('/metrics');
-
-        // 更新请求统计
-        if (data.rate_limit) {
-            document.getElementById('requests-minute').textContent = data.rate_limit.requests_per_minute || 0;
-            document.getElementById('requests-hour').textContent = data.rate_limit.requests_per_hour || 0;
-            document.getElementById('requests-day').textContent = data.rate_limit.requests_per_day || 0;
-        }
-    } catch (error) {
-        console.error('Load metrics error:', error);
-    }
-}
-
-/**
  * 加载设置
  */
 async function loadSettings() {
@@ -831,7 +813,6 @@ function startAutoRefresh() {
 
     state.refreshInterval = setInterval(() => {
         loadStatus();
-        loadMetrics();
     }, 5000);
 }
 

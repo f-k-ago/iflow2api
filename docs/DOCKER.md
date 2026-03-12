@@ -74,6 +74,16 @@ curl http://localhost:28000/health
 
 确认 `./data/iflow2api` 目录没有被删掉，并且 Compose 中仍然挂载到 `/home/appuser/.iflow2api`。
 
+### 启动时报 `PermissionError: /home/appuser/.iflow2api/logs`
+
+这是宿主机挂载目录权限不足导致的。当前 `docker-compose.yml` 已通过 `root` 用户运行容器并固定 `HOME=/home/appuser` 规避该问题。
+
+如果你之前已经启动过旧版本配置，执行一次重建即可：
+
+```bash
+docker compose up -d --force-recreate
+```
+
 ### 容器启动失败
 
 ```bash

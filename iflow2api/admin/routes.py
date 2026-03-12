@@ -275,26 +275,6 @@ async def get_status(username: str = Depends(get_current_user)) -> dict[str, Any
     }
 
 
-@admin_router.get("/metrics")
-async def get_metrics(username: str = Depends(get_current_user)) -> dict[str, Any]:
-    """获取性能指标"""
-    proxy_stats = {}
-    
-    # 获取代理统计
-    try:
-        from ..app import get_proxy
-        proxy = get_proxy()
-        if proxy and hasattr(proxy, 'get_stats'):
-            proxy_stats = proxy.get_stats()
-    except Exception as e:
-        proxy_stats = {"error": str(e)}
-    
-    return {
-        "proxy": proxy_stats,
-        "timestamp": datetime.now().isoformat(),
-    }
-
-
 # ==================== 配置管理 ====================
 
 def _mask_secret(value: str, head: int = 8, tail: int = 4) -> str:

@@ -6,8 +6,11 @@ services:
     image: ghcr.io/f-k-ago/iflow2api:edge
     container_name: iflow2api
     restart: unless-stopped
+    user: "0:0"
     ports:
       - "28000:28000"
+    environment:
+      HOME: /home/appuser
     volumes:
       # iflow2api 应用配置（WebUI 设置、账号池、管理员用户、日志、密钥）
       - ./data/iflow2api:/home/appuser/.iflow2api

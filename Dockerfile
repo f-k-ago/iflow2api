@@ -46,12 +46,10 @@ WORKDIR /app
 # 复制应用代码
 COPY --chown=appuser:appuser . .
 
-# 切换到非 root 用户
-USER appuser
-
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV HOME=/home/appuser
 
 # 暴露端口
 EXPOSE 28000

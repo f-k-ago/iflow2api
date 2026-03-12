@@ -26,7 +26,9 @@ docker compose up -d
 ```bash
 docker run -d \
   --name iflow2api \
+  --user 0:0 \
   -p 28000:28000 \
+  -e HOME=/home/appuser \
   -v "$(pwd)/data/iflow2api:/home/appuser/.iflow2api" \
   --restart unless-stopped \
   ghcr.io/f-k-ago/iflow2api:edge
