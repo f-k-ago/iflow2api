@@ -2,6 +2,7 @@
 
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -13,7 +14,6 @@ from .config import load_iflow_config, save_iflow_config, IFlowConfig
 from .crypto import ConfigEncryption
 from .autostart import set_auto_start as _set_auto_start
 from .autostart import get_auto_start as _get_auto_start
-from .autostart import is_auto_start_supported, get_platform_name
 
 
 class AppSettings(BaseModel):
@@ -37,6 +37,9 @@ class AppSettings(BaseModel):
     oauth_access_token: str = ""
     oauth_refresh_token: str = ""
     oauth_expires_at: Optional[str] = None
+    cookie: str = ""
+    cookie_email: str = ""
+    cookie_expires_at: Optional[str] = None
 
     # 应用设置
     auto_start: bool = False
@@ -183,6 +186,12 @@ def load_settings() -> AppSettings:
                     settings.oauth_refresh_token = _decrypt_token(data["oauth_refresh_token"])
                 if "oauth_expires_at" in data:
                     settings.oauth_expires_at = data["oauth_expires_at"]
+                if "cookie" in data:
+                    settings.cookie = _decrypt_token(data["cookie"])
+                if "cookie_email" in data:
+                    settings.cookie_email = data["cookie_email"]
+                if "cookie_expires_at" in data:
+                    settings.cookie_expires_at = data["cookie_expires_at"]
                 # 更新检查设置
                 if "check_update_on_startup" in data:
                     settings.check_update_on_startup = data["check_update_on_startup"]
@@ -222,6 +231,12 @@ def load_settings() -> AppSettings:
                 settings.oauth_refresh_token = iflow_config.oauth_refresh_token
             if iflow_config.oauth_expires_at:
                 settings.oauth_expires_at = iflow_config.oauth_expires_at.isoformat()
+            if iflow_config.cookie:
+                settings.cookie = iflow_config.cookie
+            if iflow_config.cookie_email:
+                settings.cookie_email = iflow_config.cookie_email
+            if iflow_config.cookie_expires_at:
+                settings.cookie_expires_at = iflow_config.cookie_expires_at
         except (FileNotFoundError, ValueError):
             pass  # 首次运行剪未登录时正常
         except Exception as _e:
@@ -252,6 +267,9 @@ def save_settings(settings: AppSettings) -> None:
         "oauth_access_token": _encrypt_token(settings.oauth_access_token),
         "oauth_refresh_token": _encrypt_token(settings.oauth_refresh_token),
         "oauth_expires_at": settings.oauth_expires_at,
+        "cookie": _encrypt_token(settings.cookie),
+        "cookie_email": settings.cookie_email,
+        "cookie_expires_at": settings.cookie_expires_at,
         # 应用设置
         "auto_start": settings.auto_start,
         "start_minimized": settings.start_minimized,
@@ -287,14 +305,35 @@ def save_settings(settings: AppSettings) -> None:
         existing_config = load_iflow_config()
     except (FileNotFoundError, ValueError):
         existing_config = IFlowConfig(api_key="", base_url="https://apis.iflow.cn/v1")
+    oauth_expires_at_dt: Optional[datetime] = None
+    if settings.oauth_expires_at:
+        try:
+            oauth_expires_at_dt = datetime.fromisoformat(settings.oauth_expires_at)
+        except ValueError:
+            logger.warning("oauth_expires_at 格式无效，跳过同步: %s", settings.oauth_expires_at)
 
-    # 只在 API Key 或 Base URL 发生变化时更新
+    # 同步完整认证字段，避免 WebUI 与 CLI 配置出现漂移
     if (
         existing_config.api_key != settings.api_key
         or existing_config.base_url != settings.base_url
+        or (existing_config.auth_type or "") != settings.auth_type
+        or (existing_config.oauth_access_token or "") != settings.oauth_access_token
+        or (existing_config.oauth_refresh_token or "") != settings.oauth_refresh_token
+        or ((existing_config.oauth_expires_at.isoformat() if existing_config.oauth_expires_at else None) != settings.oauth_expires_at)
+        or (existing_config.cookie or "") != settings.cookie
+        or (existing_config.cookie_email or "") != settings.cookie_email
+        or (existing_config.cookie_expires_at or None) != settings.cookie_expires_at
     ):
         existing_config.api_key = settings.api_key
         existing_config.base_url = settings.base_url
+        existing_config.auth_type = settings.auth_type
+        existing_config.oauth_access_token = settings.oauth_access_token
+        existing_config.oauth_refresh_token = settings.oauth_refresh_token
+        existing_config.oauth_expires_at = oauth_expires_at_dt
+        existing_config.api_key_expires_at = oauth_expires_at_dt
+        existing_config.cookie = settings.cookie
+        existing_config.cookie_email = settings.cookie_email
+        existing_config.cookie_expires_at = settings.cookie_expires_at
         try:
             save_iflow_config(existing_config)
         except (PermissionError, OSError) as e:

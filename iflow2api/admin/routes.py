@@ -72,7 +72,6 @@ class OAuthCallbackRequest(BaseModel):
 class CookieLoginRequest(BaseModel):
     """Cookie 登录请求"""
     cookie: str
-    email: str
 
 
 # 认证依赖
@@ -560,13 +559,11 @@ async def cookie_login(
 
     try:
         # 使用 cookie 刷新 API Key
-        key_data = await oauth.refresh_api_key_with_cookie(
-            request.cookie,
-            request.email
-        )
+        key_data = await oauth.refresh_api_key_with_cookie(request.cookie)
 
         api_key = key_data.get("apiKey", "")
         expired = key_data.get("expired", "")
+        resolved_email = key_data.get("email", "")
 
         if not api_key:
             return {
@@ -578,6 +575,13 @@ async def cookie_login(
         settings = load_settings()
         settings.api_key = api_key
         settings.auth_type = "cookie"
+        settings.cookie = IFlowOAuth.cookie_for_storage(request.cookie)
+        settings.cookie_email = resolved_email.strip()
+        settings.cookie_expires_at = expired or None
+        # 切换到 Cookie 模式时清理 OAuth 凭据，避免状态漂移
+        settings.oauth_access_token = ""
+        settings.oauth_refresh_token = ""
+        settings.oauth_expires_at = None
         save_settings(settings)
 
         # 重新加载代理实例
@@ -589,6 +593,7 @@ async def cookie_login(
             "message": "Cookie 登录成功",
             "data": {
                 "expired": expired,
+                "email": resolved_email,
             }
         }
 
@@ -648,6 +653,10 @@ async def oauth_callback(
             settings.oauth_refresh_token = token_data["refresh_token"]
         if token_data.get("expires_at"):
             settings.oauth_expires_at = token_data["expires_at"].isoformat()
+        # 切换到 OAuth 模式时清理 Cookie 凭据
+        settings.cookie = ""
+        settings.cookie_email = ""
+        settings.cookie_expires_at = None
         save_settings(settings)
 
         # 重新加载代理实例

@@ -24,6 +24,39 @@ class IFlowOAuth:
     def __init__(self):
         self._client: Optional[BaseUpstreamTransport] = None
 
+    @staticmethod
+    def normalize_cookie(raw_cookie: str) -> str:
+        """标准化 Cookie 字符串。"""
+        if not raw_cookie or not raw_cookie.strip():
+            raise ValueError("Cookie 不能为空")
+
+        normalized = " ".join(raw_cookie.strip().split())
+        if not normalized.endswith(";"):
+            normalized += ";"
+        return normalized
+
+    @staticmethod
+    def extract_bxauth(cookie: str) -> str:
+        """从 Cookie 中提取 BXAuth 值。"""
+        for item in cookie.split(";"):
+            part = item.strip()
+            if part.startswith("BXAuth="):
+                return part[len("BXAuth="):]
+        return ""
+
+    @classmethod
+    def cookie_for_storage(cls, raw_cookie: str) -> str:
+        """
+        生成可持久化的 Cookie（仅保留 BXAuth 字段）。
+
+        与 cpa 项目的做法保持一致，降低落盘敏感面。
+        """
+        normalized = cls.normalize_cookie(raw_cookie)
+        bxauth = cls.extract_bxauth(normalized)
+        if not bxauth:
+            raise ValueError("Cookie 必须包含 BXAuth 字段")
+        return f"BXAuth={bxauth};"
+
     async def _get_client(self) -> BaseUpstreamTransport:
         """获取或创建上游传输层客户端。"""
         if self._client is None:
@@ -228,45 +261,100 @@ class IFlowOAuth:
         except Exception:
             return False
 
-    async def refresh_api_key_with_cookie(self, cookie: str, email: str) -> Dict[str, Any]:
+    async def refresh_api_key_with_cookie(
+        self,
+        cookie: str,
+        email: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         使用 BXAuth cookie 刷新 API Key
 
         Args:
             cookie: BXAuth cookie 字符串（必须包含 BXAuth=xxx）
-            email: 用户邮箱
+            email: 用户邮箱（可选；不传时会先通过 GET 接口自动获取 name）
 
         Returns:
-            包含 apiKey 和 expired 的字典
+            包含 apiKey、expired、email 的字典
         """
-        if not cookie or not cookie.strip():
-            raise ValueError("Cookie 不能为空")
-
-        if "BXAuth=" not in cookie:
-            raise ValueError("Cookie 必须包含 BXAuth 字段")
-
-        if not email or not email.strip():
-            raise ValueError("邮箱不能为空")
-
+        normalized_cookie = self.cookie_for_storage(cookie)
+        resolved_email = (email or "").strip()
         client = await self._get_client()
 
-        # 请求体
-        request_body = {"name": email.strip()}
+        # email 未提供时，先通过 GET 接口获取 name（对齐 cpa 行为）
+        if not resolved_email:
+            key_info = await self.get_api_key_info_with_cookie(normalized_cookie)
+            resolved_email = (key_info.get("name") or "").strip()
+            if not resolved_email:
+                raise ValueError("无法自动获取邮箱/名称，请检查 Cookie 是否有效")
 
-        # 伪装成浏览器请求
-        headers = {
-            "Cookie": cookie.strip(),
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/plain, */*","User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36","Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Origin": "https://platform.iflow.cn",
-            "Referer": "https://platform.iflow.cn/",}
+        return await self._refresh_api_key_with_cookie(
+            client=client,
+            cookie=normalized_cookie,
+            email=resolved_email,
+        )
+
+    async def get_api_key_info_with_cookie(self, cookie: str) -> Dict[str, Any]:
+        """
+        使用 BXAuth cookie 获取当前 API Key 信息（GET）。
+
+        返回 name 字段用于后续刷新请求。
+        """
+        normalized_cookie = self.cookie_for_storage(cookie)
+        client = await self._get_client()
+
+        response = await client.get(
+            self.API_KEY_ENDPOINT,
+            headers={
+                "Cookie": normalized_cookie,
+                "Accept": "application/json, text/plain, */*",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Referer": "https://platform.iflow.cn/",
+            },
+            timeout=30.0,
+        )
+
+        if response.status_code == 401:
+            raise ValueError("Cookie 无效或已过期")
+        response.raise_for_status()
+
+        result = response.json()
+        if result.get("success") and result.get("data"):
+            data = result["data"]
+            return {
+                "apiKey": data.get("apiKey", "") or data.get("apiKeyMask", ""),
+                "expired": data.get("expired", "") or data.get("expireTime", ""),
+                "name": data.get("name", ""),
+            }
+
+        error_msg = result.get("message", "未知错误")
+        raise ValueError(f"获取 API Key 信息失败: {error_msg}")
+
+    async def _refresh_api_key_with_cookie(
+        self,
+        client: BaseUpstreamTransport,
+        cookie: str,
+        email: str,
+    ) -> Dict[str, Any]:
+        """执行 Cookie 刷新请求（POST）。"""
+        request_body = {"name": email}
 
         response = await client.post(
             self.API_KEY_ENDPOINT,
             json_body=request_body,
-            headers=headers,
+            headers={
+                "Cookie": cookie,
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/plain, */*",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Origin": "https://platform.iflow.cn",
+                "Referer": "https://platform.iflow.cn/",
+            },
             timeout=30.0,
         )
 
@@ -282,7 +370,8 @@ class IFlowOAuth:
             data = result["data"]
             return {
                 "apiKey": data.get("apiKey", ""),
-                "expired": data.get("expired", ""),
+                "expired": data.get("expired", "") or data.get("expireTime", ""),
+                "email": email,
             }
         else:
             error_msg = result.get("message", "未知错误")

@@ -435,21 +435,13 @@ async function importFromCli() {
  */
 async function cookieLogin() {
     const cookieInput = document.getElementById('cookie-input');
-    const cookieEmail = document.getElementById('cookie-email');
     const cookieStatus = document.getElementById('cookie-status');
     const cookieSubmitBtn = document.getElementById('cookie-submit-btn');
 
     const cookie = cookieInput.value.trim();
-    const email = cookieEmail.value.trim();
 
     if (!cookie) {
         cookieStatus.textContent = '请输入 Cookie';
-        cookieStatus.style.color = 'red';
-        return;
-    }
-
-    if (!email) {
-        cookieStatus.textContent = '请输入邮箱地址';
         cookieStatus.style.color = 'red';
         return;
     }
@@ -467,13 +459,12 @@ async function cookieLogin() {
     try {
         const result = await apiRequest('/cookie/login', {
             method: 'POST',
-            body: JSON.stringify({ cookie, email })
+            body: JSON.stringify({ cookie })
         });
 
         if (result.success) {
             showToast('Cookie 登录成功！', 'success');
             cookieInput.value = '';
-            cookieEmail.value = '';
             cookieStatus.textContent = '';
             closeCookieModal();
             loadSettings();
@@ -505,7 +496,7 @@ function closeCookieModal() {
     const modal = document.getElementById('cookie-modal');
     modal.classList.remove('active');
     document.getElementById('cookie-input').value = '';
-    document.getElementById('cookie-email').value = '';document.getElementById('cookie-status').textContent = '';
+    document.getElementById('cookie-status').textContent = '';
 }
 
 /**

@@ -2,7 +2,6 @@
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel, Field
@@ -21,7 +20,7 @@ class IFlowConfig(BaseModel):
     installation_id: Optional[str] = None
     # OAuth 相关字段
     auth_type: Optional[str] = Field(
-        default=None, description="认证类型: oauth-iflow, api-key, openai-compatible"
+        default=None, description="认证类型: oauth-iflow, cookie, api-key, openai-compatible"
     )
     oauth_access_token: Optional[str] = Field(
         default=None, description="OAuth 访问令牌"
@@ -35,6 +34,16 @@ class IFlowConfig(BaseModel):
     # apiKey 过期时间（与 oauth_expires_at 相同，用于清晰语义）
     api_key_expires_at: Optional[datetime] = Field(
         default=None, description="apiKey 过期时间（OAuth 模式下与 token 同步）"
+    )
+    # Cookie 相关字段
+    cookie: Optional[str] = Field(
+        default=None, description="Cookie 登录凭据（仅 BXAuth）"
+    )
+    cookie_email: Optional[str] = Field(
+        default=None, description="Cookie 登录绑定邮箱"
+    )
+    cookie_expires_at: Optional[str] = Field(
+        default=None, description="Cookie 模式下 apiKey 过期时间（原始字符串）"
     )
 
 
@@ -98,7 +107,7 @@ def load_iflow_config() -> IFlowConfig:
 
     # 检查认证类型
     auth_type = data.get("selectedAuthType", "")
-    if auth_type not in ("oauth-iflow", "api-key"):
+    if auth_type not in ("oauth-iflow", "cookie", "api-key"):
         # 也支持 openai-compatible 模式，但会给出警告
         if auth_type == "openai-compatible":
             logger.warning("当前使用 openai-compatible 模式，部分模型可能不可用")
@@ -149,6 +158,9 @@ def load_iflow_config() -> IFlowConfig:
         oauth_refresh_token=data.get("oauth_refresh_token"),
         oauth_expires_at=oauth_expires_at,
         api_key_expires_at=api_key_expires_at,
+        cookie=data.get("cookie"),
+        cookie_email=data.get("cookie_email"),
+        cookie_expires_at=data.get("cookie_expires_at"),
     )
 
 
@@ -218,8 +230,20 @@ def save_iflow_config(config: IFlowConfig) -> None:
         existing_data["oauth_refresh_token"] = config.oauth_refresh_token
     if config.oauth_expires_at is not None:
         existing_data["oauth_expires_at"] = config.oauth_expires_at.isoformat()
+    else:
+        existing_data.pop("oauth_expires_at", None)
     if config.api_key_expires_at is not None:
         existing_data["api_key_expires_at"] = config.api_key_expires_at.isoformat()
+    else:
+        existing_data.pop("api_key_expires_at", None)
+    if config.cookie is not None:
+        existing_data["cookie"] = config.cookie
+    if config.cookie_email is not None:
+        existing_data["cookie_email"] = config.cookie_email
+    if config.cookie_expires_at is not None:
+        existing_data["cookie_expires_at"] = config.cookie_expires_at
+    else:
+        existing_data.pop("cookie_expires_at", None)
 
     # 保存到文件
     with open(config_path, "w", encoding="utf-8") as f:

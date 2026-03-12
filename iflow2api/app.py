@@ -556,15 +556,32 @@ def update_proxy_token(token_data: dict):
     global _proxy, _config
     if _proxy and _config:
         logger.info("检测到 Token 刷新，更新代理配置")
-        _config.api_key = token_data["access_token"]
-        _config.oauth_access_token = token_data["access_token"]
-        
-        # 更新其他 token 相关字段
-        if "refresh_token" in token_data:
-            _config.oauth_refresh_token = token_data["refresh_token"]
-        if "expires_at" in token_data:
-            _config.oauth_expires_at = token_data["expires_at"]
-        
+
+        # OAuth 刷新
+        if token_data.get("auth_type") == "oauth-iflow" or "access_token" in token_data:
+            access_token = token_data.get("access_token")
+            if access_token:
+                _config.api_key = access_token
+                _config.oauth_access_token = access_token
+            if "refresh_token" in token_data:
+                _config.oauth_refresh_token = token_data["refresh_token"]
+            if "expires_at" in token_data:
+                _config.oauth_expires_at = token_data["expires_at"]
+            _config.auth_type = "oauth-iflow"
+
+        # Cookie 刷新
+        elif token_data.get("auth_type") == "cookie" or "api_key" in token_data:
+            api_key = token_data.get("api_key")
+            if api_key:
+                _config.api_key = api_key
+            _config.auth_type = "cookie"
+            if "cookie" in token_data:
+                _config.cookie = token_data["cookie"]
+            if "cookie_email" in token_data:
+                _config.cookie_email = token_data["cookie_email"]
+            if "cookie_expires_at" in token_data:
+                _config.cookie_expires_at = token_data["cookie_expires_at"]
+
         # 保存到配置文件
         save_iflow_config(_config)
         logger.info("Token 已保存到配置文件")

@@ -478,10 +478,6 @@
                     <textarea id="cookie-input" rows="3" placeholder="粘贴完整的 Cookie 字符串（必须包含 BXAuth=xxx）"></textarea>
                     <p class="hint">从浏览器开发者工具中复制 Cookie，必须包含 BXAuth 字段</p>
                 </div>
-                <div class="form-group">
-                    <label for="cookie-email">邮箱地址</label>
-                    <input type="email" id="cookie-email" placeholder="输入您的邮箱地址">
-                </div>
                 <p id="cookie-status" class="hint"></p>
             </div>
             <div class="modal-footer">
@@ -494,22 +490,14 @@
     <script src="/admin/static/js/app.js">// Cookie 登录处理
         const cookieSubmitBtn = document.getElementById('cookie-submit-btn');
         const cookieInput = document.getElementById('cookie-input');
-        const cookieEmail = document.getElementById('cookie-email');
         const cookieStatus = document.getElementById('cookie-status');
 
         if (cookieSubmitBtn) {
             cookieSubmitBtn.addEventListener('click', async () => {
                 const cookie = cookieInput.value.trim();
-                const email = cookieEmail.value.trim();
 
                 if (!cookie) {
                     cookieStatus.textContent = '请输入 Cookie';
-                    cookieStatus.style.color = 'red';
-                    return;
-                }
-
-                if (!email) {
-                    cookieStatus.textContent = '请输入邮箱地址';
                     cookieStatus.style.color = 'red';
                     return;
                 }
@@ -530,7 +518,7 @@
                         headers: {
                             'Content-Type': 'application/json','Authorization': `Bearer ${localStorage.getItem('token')}`
                         },
-                        body: JSON.stringify({ cookie, email })
+                        body: JSON.stringify({ cookie })
                     });
 
                     const result = await response.json();
@@ -541,7 +529,6 @@
 
                         // 清空输入
                         cookieInput.value = '';
-                        cookieEmail.value = '';
 
                         // 刷新设置
                         setTimeout(() => {

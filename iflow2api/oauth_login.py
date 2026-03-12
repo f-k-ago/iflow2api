@@ -4,7 +4,6 @@ import secrets
 import webbrowser
 import threading
 import asyncio
-from typing import Optional
 
 from .oauth import IFlowOAuth
 from .web_server import OAuthCallbackServer, find_available_port
@@ -123,8 +122,13 @@ class OAuthLoginHandler:
                         existing_config.oauth_refresh_token = token_data.get(
                             "refresh_token", ""
                         )
+                        # 切换到 OAuth 模式时清理 Cookie 凭据
+                        existing_config.cookie = ""
+                        existing_config.cookie_email = ""
+                        existing_config.cookie_expires_at = None
                         if token_data.get("expires_at"):
                             existing_config.oauth_expires_at = token_data["expires_at"]
+                            existing_config.api_key_expires_at = token_data["expires_at"]
 
                         save_iflow_config(existing_config)
 
