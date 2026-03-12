@@ -84,6 +84,75 @@ function formatDateTime(isoString) {
     return date.toLocaleString('zh-CN');
 }
 
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function formatAuthType(authType) {
+    const authTypeMap = {
+        'api-key': 'API Key',
+        'oauth-iflow': 'OAuth',
+        'cookie': 'Cookie',
+        'not_logged_in': '未登录',
+    };
+    return authTypeMap[authType] || authType || '未知';
+}
+
+function renderUpstreamAccounts(accounts, tableId, includeActions = false) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+
+    const tbody = table.querySelector('tbody');
+    if (!tbody) return;
+
+    tbody.innerHTML = '';
+
+    if (!accounts || accounts.length === 0) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td colspan="${includeActions ? 5 : 4}">暂无账号</td>`;
+        tbody.appendChild(tr);
+        return;
+    }
+
+    accounts.forEach((account) => {
+        const tr = document.createElement('tr');
+        const statusText = account.enabled ? '启用' : '停用';
+        const detailText = [account.email, account.phone, account.cookie_expires_at]
+            .filter(Boolean)
+            .join(' / ');
+        const labelText = account.is_primary
+            ? `${escapeHtml(account.label)} <span class="hint">(主账号)</span>`
+            : escapeHtml(account.label);
+
+        if (includeActions) {
+            tr.innerHTML = `
+                <td>${labelText}</td>
+                <td>${escapeHtml(formatAuthType(account.auth_type))}</td>
+                <td>${escapeHtml(account.api_key_masked || '--')}<br><span class="hint">${escapeHtml(account.base_url || '')}</span></td>
+                <td>${escapeHtml(statusText)}<br><span class="hint">${escapeHtml(detailText || '--')}</span></td>
+                <td>
+                    <button class="btn btn-secondary btn-sm" onclick="activateUpstreamAccount('${account.id}')" ${account.is_primary ? 'disabled' : ''}>设为主账号</button>
+                    <button class="btn btn-secondary btn-sm" onclick="toggleUpstreamAccount('${account.id}', ${!account.enabled})">${account.enabled ? '停用' : '启用'}</button>
+                    <button class="btn btn-danger btn-sm" onclick="deleteUpstreamAccount('${account.id}')">删除</button>
+                </td>
+            `;
+        } else {
+            tr.innerHTML = `
+                <td>${labelText}</td>
+                <td>${escapeHtml(formatAuthType(account.auth_type))}</td>
+                <td>${escapeHtml(account.api_key_masked || '--')}</td>
+                <td>${escapeHtml(statusText)}</td>
+            `;
+        }
+        tbody.appendChild(tr);
+    });
+}
+
 // ==================== 认证相关 ====================
 
 /**
@@ -234,15 +303,10 @@ function showSection(sectionId) {
 async function loadAccountInfo() {
     try {
         const data = await apiRequest('/account-info');
+        state.accountInfo = data;
 
         // 更新认证方式
-        const authTypeMap = {
-            'api-key': 'API Key',
-            'oauth-iflow': 'OAuth',
-            'cookie': 'Cookie',
-            'not_logged_in': '未登录'
-        };
-        document.getElementById('account-auth-type').textContent = authTypeMap[data.auth_type] || data.auth_type || '未知';
+        document.getElementById('account-auth-type').textContent = formatAuthType(data.auth_type);
 
         // 更新 API Key
         document.getElementById('account-api-key').textContent = data.api_key_masked || '未配置';
@@ -272,6 +336,12 @@ async function loadAccountInfo() {
         } else {
             cookieExpireRow.style.display = 'none';
         }
+
+        document.getElementById('account-total').textContent = data.total_accounts || 0;
+        document.getElementById('account-enabled-total').textContent = data.enabled_accounts || 0;
+
+        renderUpstreamAccounts(data.accounts || [], 'account-list-table', false);
+        renderUpstreamAccounts(data.accounts || [], 'upstream-accounts-table', true);
     } catch (error) {
         console.error('Load account info error:', error);
     }
@@ -347,8 +417,9 @@ async function loadSettings() {
         const data = await apiRequest('/settings');
         state.settings = data;
 
-        // 填充 iFlow 配置
-        document.getElementById('setting-api-key').value = data.api_key || '';
+        // 账号池新增表单只保留默认 Base URL，不自动回填真实 API Key
+        document.getElementById('setting-account-label').value = '';
+        document.getElementById('setting-api-key').value = '';
         document.getElementById('setting-base-url').value = data.base_url || '';
         
         // 填充服务器配置
@@ -389,8 +460,7 @@ async function loadSettings() {
  */
 async function saveSettings() {
     const settings = {
-        // iFlow 配置
-        api_key: document.getElementById('setting-api-key').value,
+        // 兼容层默认 Base URL
         base_url: document.getElementById('setting-base-url').value,
         // 服务器配置
         host: document.getElementById('setting-host').value,
@@ -433,9 +503,37 @@ async function importFromCli() {
     try {
         const data = await apiRequest('/import-from-cli', { method: 'POST' });
         showToast(data.message, 'success');
-        // 更新表单
-        document.getElementById('setting-api-key').value = data.api_key || '';
+        document.getElementById('setting-api-key').value = '';
         document.getElementById('setting-base-url').value = data.base_url || '';
+        loadAccountInfo();
+    } catch (error) {
+        showToast(error.message, 'error');
+    }
+}
+
+async function createApiKeyAccount() {
+    const label = document.getElementById('setting-account-label').value.trim();
+    const apiKey = document.getElementById('setting-api-key').value.trim();
+    const baseUrl = document.getElementById('setting-base-url').value.trim();
+
+    if (!apiKey) {
+        showToast('请输入 API Key', 'error');
+        return;
+    }
+
+    try {
+        await apiRequest('/upstream-accounts', {
+            method: 'POST',
+            body: JSON.stringify({
+                label,
+                api_key: apiKey,
+                base_url: baseUrl,
+            }),
+        });
+        showToast('账号已添加到账号池', 'success');
+        document.getElementById('setting-account-label').value = '';
+        document.getElementById('setting-api-key').value = '';
+        loadAccountInfo();
     } catch (error) {
         showToast(error.message, 'error');
     }
@@ -549,8 +647,8 @@ async function oauthLogin() {
                             body: JSON.stringify({ code }),
                         });
                         showToast(result.message, 'success');
-                        // 更新表单
-                        document.getElementById('setting-api-key').value = result.api_key || '';
+                        document.getElementById('setting-api-key').value = '';
+                        loadSettings();
                         loadAccountInfo();
                     } catch (error) {
                         showToast(error.message, 'error');
@@ -564,6 +662,49 @@ async function oauthLogin() {
         
         window.addEventListener('message', _oauthMessageHandler);
         
+    } catch (error) {
+        showToast(error.message, 'error');
+    }
+}
+
+async function toggleUpstreamAccount(accountId, enabled) {
+    try {
+        await apiRequest(`/upstream-accounts/${accountId}/enabled`, {
+            method: 'PATCH',
+            body: JSON.stringify({ enabled }),
+        });
+        showToast('账号状态已更新', 'success');
+        loadAccountInfo();
+    } catch (error) {
+        showToast(error.message, 'error');
+    }
+}
+
+async function activateUpstreamAccount(accountId) {
+    try {
+        await apiRequest(`/upstream-accounts/${accountId}/activate`, {
+            method: 'POST',
+        });
+        showToast('主账号已切换', 'success');
+        loadSettings();
+        loadAccountInfo();
+    } catch (error) {
+        showToast(error.message, 'error');
+    }
+}
+
+async function deleteUpstreamAccount(accountId) {
+    if (!confirm('确定要删除这个上游账号吗？')) {
+        return;
+    }
+
+    try {
+        await apiRequest(`/upstream-accounts/${accountId}`, {
+            method: 'DELETE',
+        });
+        showToast('账号已删除', 'success');
+        loadSettings();
+        loadAccountInfo();
     } catch (error) {
         showToast(error.message, 'error');
     }
@@ -798,6 +939,7 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('reset-settings-btn').addEventListener('click', loadSettings);
 
     // iFlow 配置按钮
+    document.getElementById('add-api-account-btn').addEventListener('click', createApiKeyAccount);
     document.getElementById('import-cli-btn').addEventListener('click', importFromCli);
     document.getElementById('oauth-login-btn').addEventListener('click', oauthLogin);
     document.getElementById('cookie-login-btn').addEventListener('click', openCookieModal);

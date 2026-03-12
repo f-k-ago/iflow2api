@@ -1,7 +1,6 @@
 """并发限制模块 - 实现官方的单并发限制"""
 
 import asyncio
-import time
 from threading import Lock
 from typing import Optional, Dict
 from contextlib import asynccontextmanager
@@ -94,8 +93,25 @@ class ConcurrencyLimiter:
         while True:
             with self._lock:
                 if state["count"] < self.max_concurrent:
-                    return# 短暂等待后重试
+                    return
+            # 短暂等待后重试
             await asyncio.sleep(0.1)
+
+    def try_acquire_nowait(self, api_key: str) -> bool:
+        """尝试立即获取并发令牌，不阻塞等待。"""
+        state = self._get_or_create_key_state(api_key)
+        with self._lock:
+            if state["count"] >= self.max_concurrent:
+                return False
+            state["count"] += 1
+            return True
+
+    def release(self, api_key: str) -> None:
+        """释放并发令牌。"""
+        state = self._get_or_create_key_state(api_key)
+        with self._lock:
+            if state["count"] > 0:
+                state["count"] -= 1
 
     def get_stats(self, api_key: str) -> dict:
         """获取 API Key 的并发统计

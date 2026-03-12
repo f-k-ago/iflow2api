@@ -597,6 +597,7 @@ class IFlowProxy:
         self,
         request_body: dict,
         stream: Literal[True],
+        apply_concurrency_limit: bool = ...,
     ) -> AsyncIterator[bytes]: ...
 
     @overload
@@ -604,12 +605,14 @@ class IFlowProxy:
         self,
         request_body: dict,
         stream: Literal[False] = ...,
+        apply_concurrency_limit: bool = ...,
     ) -> dict: ...
 
     async def chat_completions(
         self,
         request_body: dict,
         stream: bool = False,
+        apply_concurrency_limit: bool = True,
     ) -> "dict | AsyncIterator[bytes]":
         """
         调用 chat completions API
@@ -617,6 +620,7 @@ class IFlowProxy:
         Args:
             request_body: 请求体
             stream: 是否流式响应
+            apply_concurrency_limit: 是否应用代理内部的并发限制
 
         Returns:
             非流式: 返回完整响应 dict
@@ -629,7 +633,7 @@ class IFlowProxy:
         settings = load_settings()
 
         # 如果启用了并发限制，则使用并发控制
-        if settings.enable_concurrency_limit:
+        if apply_concurrency_limit and settings.enable_concurrency_limit:
             limiter = get_concurrency_limiter(max_concurrent=settings.max_concurrent_requests)
             # 使用 API Key 作为并发限制的标识
             async with limiter.acquire(self.config.api_key, timeout=300.0):

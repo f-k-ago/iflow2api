@@ -3,11 +3,12 @@
 import sys
 import json
 import logging
+import os as _os
 import uuid
 import asyncio
 import time
 from datetime import datetime
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -16,22 +17,17 @@ from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
-logger = logging.getLogger("iflow2api")
-
-from .config import load_iflow_config, check_iflow_login, IFlowConfig, save_iflow_config
+from .account_pool import NoUpstreamAccountError, acquire_account_lease
+from .config import load_iflow_config, check_iflow_login, IFlowConfig
 from .proxy import IFlowProxy
 from .token_refresher import OAuthTokenRefresher
 from .vision import (
-    is_vision_model,
-    supports_vision,
-    get_vision_model_info,
     detect_image_content,
-    process_message_content,
     get_vision_models_list,
-    get_max_images,
-    DEFAULT_VISION_MODEL,
 )
 from .version import get_version, get_startup_info, get_diagnostic_info, is_docker
+
+logger = logging.getLogger("iflow2api")
 
 
 # ============ Anthropic 格式转换函数 ============
@@ -584,39 +580,57 @@ def get_proxy() -> IFlowProxy:
 
 
 def update_proxy_token(token_data: dict):
-    """Token 刷新回调，同步更新内存中的代理配置并保存"""
-    global _proxy, _config
-    if _proxy and _config:
-        logger.info("检测到 Token 刷新，更新代理配置")
+    """Token 刷新回调，刷新兼容层缓存。"""
+    account_id = token_data.get("account_id")
+    auth_type = token_data.get("auth_type") or "unknown"
+    logger.info("检测到账号凭据刷新: account_id=%s, auth_type=%s", account_id, auth_type)
+    reload_proxy()
 
-        # OAuth 刷新
-        if token_data.get("auth_type") == "oauth-iflow" or "access_token" in token_data:
-            access_token = token_data.get("access_token")
-            if access_token:
-                _config.api_key = access_token
-                _config.oauth_access_token = access_token
-            if "refresh_token" in token_data:
-                _config.oauth_refresh_token = token_data["refresh_token"]
-            if "expires_at" in token_data:
-                _config.oauth_expires_at = token_data["expires_at"]
-            _config.auth_type = "oauth-iflow"
 
-        # Cookie 刷新
-        elif token_data.get("auth_type") == "cookie" or "api_key" in token_data:
-            api_key = token_data.get("api_key")
-            if api_key:
-                _config.api_key = api_key
-            _config.auth_type = "cookie"
-            if "cookie" in token_data:
-                _config.cookie = token_data["cookie"]
-            if "cookie_email" in token_data:
-                _config.cookie_email = token_data["cookie_email"]
-            if "cookie_expires_at" in token_data:
-                _config.cookie_expires_at = token_data["cookie_expires_at"]
+def _extract_upstream_error(exc: Exception) -> tuple[int, str]:
+    """提取上游异常中的状态码和错误消息。"""
+    error_msg = str(exc)
+    status_code = 500
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            status_code = response.status_code
+            error_data = response.json()
+            error_msg = error_data.get("msg", error_msg)
+        except Exception:
+            pass
+    return status_code, error_msg
 
-        # 保存到配置文件
-        save_iflow_config(_config)
-        logger.info("Token 已保存到配置文件")
+
+def _map_upstream_exception(exc: Exception) -> JSONResponse:
+    """将上游异常映射为兼容响应。"""
+    status_code, error_msg = _extract_upstream_error(exc)
+    return create_error_response(status_code, error_msg)
+
+
+async def _acquire_upstream_lease():
+    try:
+        return await acquire_account_lease()
+    except NoUpstreamAccountError as exc:
+        raise IFlowNotConfiguredError(str(exc)) from exc
+
+
+async def _run_nonstream_with_lease(lease, request_body: dict) -> dict:
+    """执行非流式请求；客户端取消时等待上游运行结束后再释放账号。"""
+    task = asyncio.create_task(
+        lease.proxy.chat_completions(
+            request_body,
+            stream=False,
+            apply_concurrency_limit=False,
+        )
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        logger.info("客户端取消非流式请求，等待上游运行完成后释放账号: %s", lease.account.id)
+        with suppress(Exception):
+            await task
+        raise
 
 
 @asynccontextmanager
@@ -630,13 +644,18 @@ async def lifespan(app: FastAPI):
     # 启动时打印版本和系统信息
     logger.info("%s", get_startup_info())
     
-    # 初始化并发信号量（无论是否有配置都需要）
-    from .settings import load_settings
+    # 初始化设置与兼容并发信号量
+    from .settings import get_enabled_upstream_accounts, load_settings
     settings = load_settings()
-    _api_request_lock = asyncio.Semaphore(settings.api_concurrency)
-    logger.info("上游 API 并发数: %d", settings.api_concurrency)
-    if settings.api_concurrency > 1:
-        logger.warning("警告: 并发数 > 1 可能导致上游 API 返回 429 限流错误，建议保持默认值 1")
+    enabled_accounts = get_enabled_upstream_accounts(settings)
+    effective_concurrency = max(settings.api_concurrency, len(enabled_accounts), 1)
+    _api_request_lock = asyncio.Semaphore(effective_concurrency)
+    logger.info(
+        "账号池状态: enabled=%d, configured_total=%d, runtime_concurrency=%d",
+        len(enabled_accounts),
+        len(settings.upstream_accounts),
+        effective_concurrency,
+    )
     
     # 尝试加载 iFlow 配置（可选）
     # 优先检查应用主配置 ~/.iflow2api/config.json（用户通过 WebUI 登录后保存）
@@ -654,12 +673,6 @@ async def lifespan(app: FastAPI):
         if config.model_name:
             logger.info("默认模型: %s", config.model_name)
             
-        # 启动 Token 刷新任务
-        _refresher = OAuthTokenRefresher()
-        _refresher.set_refresh_callback(update_proxy_token)
-        _refresher.start()
-        logger.info("已启动 Token 自动刷新任务")
-        
     except FileNotFoundError:
         # 检查是否存在应用主配置（用户通过 WebUI 登录）
         if app_config_exists:
@@ -671,6 +684,12 @@ async def lifespan(app: FastAPI):
     except ValueError as e:
         logger.warning("iFlow 配置文件格式错误: %s", e)
         logger.warning("请通过 WebUI 重新登录")
+
+    # 启动 Token 刷新任务（无账号时也允许启动，后台会自行跳过）
+    _refresher = OAuthTokenRefresher()
+    _refresher.set_refresh_callback(update_proxy_token)
+    _refresher.start()
+    logger.info("已启动 Token 自动刷新任务")
 
     yield
 
@@ -834,7 +853,6 @@ async def custom_auth_middleware(request: Request, call_next):
 # ============ 管理界面 ============
 
 # 挂载静态文件目录
-import os as _os
 _admin_static_dir = _os.path.join(_os.path.dirname(__file__), "admin", "static")
 if _os.path.exists(_admin_static_dir):
     app.mount("/admin/static", StaticFiles(directory=_admin_static_dir), name="admin_static")
@@ -853,7 +871,7 @@ async def admin_page():
 
 # 注册管理界面路由
 try:
-    from .admin.routes import admin_router, set_server_manager
+    from .admin.routes import admin_router
     app.include_router(admin_router)
 except ImportError as e:
     logger.warning("无法加载管理界面路由: %s", e)
@@ -1167,11 +1185,6 @@ OpenAI 兼容的 Chat Completions API 端点。
 async def chat_completions_openai(request: Request):
     """Chat Completions API - OpenAI 格式"""
     try:
-        proxy = get_proxy()
-    except IFlowNotConfiguredError as e:
-        return create_error_response(503, str(e), "iflow_not_configured")
-    
-    try:
         body_bytes = await request.body()
         body = json.loads(body_bytes.decode("utf-8"))
         if "messages" not in body:
@@ -1184,71 +1197,89 @@ async def chat_completions_openai(request: Request):
                      model, stream, msg_count, has_tools)
 
         if stream:
-            # 流式响应 - 整个流式传输过程都在锁内进行
             try:
-                async def generate_with_lock():
-                    """在锁内完成整个流式传输"""
-                    async with _api_request_lock:
-                        logger.debug("获取上游流式响应...")
-                        stream_gen = await proxy.chat_completions(body, stream=True)
-                        chunk_count = 0
-                        try:
-                            async for chunk in stream_gen:
-                                chunk_count += 1
-                                if chunk_count <= 3:
-                                    logger.debug("流式chunk[%d]: %s", chunk_count, chunk[:200])
-                                yield chunk
-                        except Exception as e:
-                            # 传输过程中的错误
-                            logger.error("Streaming error after %d chunks: %s", chunk_count, e)
-                        else:
-                            # 正常结束：确保发送 [DONE] 标记（上游不一定发送）
-                            if chunk_count > 0:
-                                yield b"data: [DONE]\n\n"
-                        finally:
-                            logger.debug("流式完成: 共 %d chunks", chunk_count)
-                            if chunk_count == 0:
-                                # 上游返回了空的流式响应，生成一个错误回退
-                                logger.warning("生成错误回退响应 (0 chunks from upstream)")
-                                import time as _time
-                                fallback = {
-                                    "id": f"fallback-{int(_time.time())}",
-                                    "object": "chat.completion.chunk",
-                                    "created": int(_time.time()),
-                                    "model": model,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {"role": "assistant", "content": "上游api返回空信息，可能是上下文超限了"},
-                                        "finish_reason": "stop"
-                                    }]
-                                }
-                                yield ("data: " + json.dumps(fallback, ensure_ascii=False) + "\n\n").encode("utf-8")
-                                yield b"data: [DONE]\n\n"
-                
-                return StreamingResponse(
-                    generate_with_lock(),
-                    media_type="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        "X-Accel-Buffering": "no",
-                    },
+                lease = await _acquire_upstream_lease()
+            except IFlowNotConfiguredError as e:
+                return create_error_response(503, str(e), "iflow_not_configured")
+            except asyncio.TimeoutError:
+                return create_error_response(429, "当前所有上游账号都在忙，请稍后重试", "rate_limit_exceeded")
+
+            logger.debug("分配上游账号: account_id=%s, label=%s", lease.account.id, lease.account.label)
+
+            try:
+                stream_gen = await lease.proxy.chat_completions(
+                    body,
+                    stream=True,
+                    apply_concurrency_limit=False,
                 )
             except Exception as e:
-                error_msg = str(e)
-                resp = getattr(e, "response", None)
-                if resp is not None:
-                    try:
-                        error_data = resp.json()
-                        error_msg = error_data.get("msg", error_msg)
-                    except Exception:
-                        pass
-                return create_error_response(500, error_msg)
+                await lease.close()
+                return _map_upstream_exception(e)
+
+            async def generate_with_lease():
+                """持有账号租约直到整个流式响应结束。"""
+                chunk_count = 0
+                cancelled = False
+                try:
+                    async for chunk in stream_gen:
+                        chunk_count += 1
+                        if chunk_count <= 3:
+                            logger.debug("流式chunk[%d]: %s", chunk_count, chunk[:200])
+                        yield chunk
+                except asyncio.CancelledError:
+                    cancelled = True
+                    logger.info("客户端取消流式请求，立即释放账号令牌: %s", lease.account.id)
+                    raise
+                except Exception as e:
+                    logger.error("Streaming error after %d chunks: %s", chunk_count, e)
+                else:
+                    if chunk_count > 0:
+                        yield b"data: [DONE]\n\n"
+                finally:
+                    logger.debug("流式完成: account=%s, chunks=%d", lease.account.id, chunk_count)
+                    if not cancelled and chunk_count == 0:
+                        logger.warning("生成错误回退响应 (0 chunks from upstream)")
+                        import time as _time
+
+                        fallback = {
+                            "id": f"fallback-{int(_time.time())}",
+                            "object": "chat.completion.chunk",
+                            "created": int(_time.time()),
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": "上游api返回空信息，可能是上下文超限了"},
+                                "finish_reason": "stop"
+                            }]
+                        }
+                        yield ("data: " + json.dumps(fallback, ensure_ascii=False) + "\n\n").encode("utf-8")
+                        yield b"data: [DONE]\n\n"
+                    await lease.close()
+
+            return StreamingResponse(
+                generate_with_lease(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         else:
-            # 使用锁确保同一时间只有一个上游请求
-            async with _api_request_lock:
-                logger.debug("获取上游非流式响应...")
-                result = await proxy.chat_completions(body, stream=False)
+            try:
+                lease = await _acquire_upstream_lease()
+            except IFlowNotConfiguredError as e:
+                return create_error_response(503, str(e), "iflow_not_configured")
+            except asyncio.TimeoutError:
+                return create_error_response(429, "当前所有上游账号都在忙，请稍后重试", "rate_limit_exceeded")
+
+            try:
+                logger.debug("获取上游非流式响应: account_id=%s", lease.account.id)
+                result = await _run_nonstream_with_lease(lease, body)
+            except Exception as e:
+                return _map_upstream_exception(e)
+            finally:
+                await lease.close()
             # 验证响应包含有效的 choices
             if not result.get("choices"):
                 logger.error("API 响应缺少 choices 数组: %s", json.dumps(result, ensure_ascii=False)[:500])
@@ -1269,17 +1300,7 @@ async def chat_completions_openai(request: Request):
     except json.JSONDecodeError as e:
         return create_error_response(400, f"Invalid JSON: {e}", "invalid_request_error")
     except Exception as e:
-        error_msg = str(e)
-        status_code = 500
-        resp = getattr(e, "response", None)
-        if resp is not None:
-            try:
-                status_code = resp.status_code
-                error_data = resp.json()
-                error_msg = error_data.get("msg", error_msg)
-            except Exception:
-                pass
-        return create_error_response(status_code, error_msg)
+        return _map_upstream_exception(e)
 
 
 @app.post(
@@ -1423,119 +1444,129 @@ async def messages_anthropic(request: Request):
         logger.info("Anthropic 格式请求: model=%s → %s, stream=%s",
                      original_model, mapped_model, stream)
 
-        try:
-            proxy = get_proxy()
-        except IFlowNotConfiguredError as e:
-            return JSONResponse(
-                status_code=503,
-                content={"type": "error", "error": {"type": "iflow_not_configured", "message": str(e)}}
-            )
-
         if stream:
             # 流式响应 - 转换为 Anthropic SSE 格式
             # 加载配置以获取思考链设置
             from .settings import load_settings
             settings = load_settings()
             preserve_reasoning = settings.preserve_reasoning_content
-            
-            # 整个流式传输过程都在锁内进行
-            async def generate_anthropic_stream_with_lock():
-                """在锁内完成整个流式传输（含 tool_use 支持）"""
-                async with _api_request_lock:
-                    logger.debug("获取上游流式响应 (Anthropic)...")
-                    stream_gen = await proxy.chat_completions(openai_body, stream=True)
+            try:
+                lease = await _acquire_upstream_lease()
+            except IFlowNotConfiguredError as e:
+                return JSONResponse(
+                    status_code=503,
+                    content={"type": "error", "error": {"type": "iflow_not_configured", "message": str(e)}}
+                )
+            except asyncio.TimeoutError:
+                return JSONResponse(
+                    status_code=429,
+                    content={"type": "error", "error": {"type": "rate_limit_exceeded", "message": "当前所有上游账号都在忙，请稍后重试"}}
+                )
 
-                    # 发送 message_start
-                    yield create_anthropic_stream_message_start(mapped_model).encode('utf-8')
+            logger.debug("获取上游流式响应 (Anthropic): account_id=%s", lease.account.id)
+            try:
+                stream_gen = await lease.proxy.chat_completions(
+                    openai_body,
+                    stream=True,
+                    apply_concurrency_limit=False,
+                )
+            except Exception as e:
+                await lease.close()
+                status_code, error_msg = _extract_upstream_error(e)
+                return JSONResponse(
+                    status_code=status_code,
+                    content={"type": "error", "error": {"type": "api_error", "message": error_msg}},
+                )
 
-                    output_tokens = 0
-                    buffer = ""
-                    block_index = 0
-                    stop_reason = "end_turn"
+            async def generate_anthropic_stream_with_lease():
+                """持有账号租约直到整个 Anthropic SSE 流结束。"""
+                # 发送 message_start
+                yield create_anthropic_stream_message_start(mapped_model).encode('utf-8')
 
-                    # 文本/思考块状态
-                    current_text_block_type = None   # None | "text" | "thinking"
-                    current_text_block_index = -1
+                output_tokens = 0
+                buffer = ""
+                block_index = 0
+                stop_reason = "end_turn"
 
-                    # 工具调用块状态: openai_tc_index → {block_index, id}
-                    tool_call_block_map: dict = {}
-                    current_tc_index = -1  # 当前正在流式传输的工具调用索引
+                # 文本/思考块状态
+                current_text_block_type = None   # None | "text" | "thinking"
+                current_text_block_index = -1
 
-                    async def _process_parsed_chunk(parsed: dict):
-                        """处理单个已解析的 SSE chunk，yield Anthropic 事件"""
-                        nonlocal block_index, output_tokens, stop_reason
-                        nonlocal current_text_block_type, current_text_block_index
-                        nonlocal current_tc_index
+                # 工具调用块状态: openai_tc_index → {block_index, id}
+                tool_call_block_map: dict = {}
+                current_tc_index = -1  # 当前正在流式传输的工具调用索引
 
-                        choices = parsed.get("choices", [])
-                        if not choices:
-                            return
-                        choice = choices[0]
-                        delta = choice.get("delta", {})
-                        finish_reason = choice.get("finish_reason")
+                async def _process_parsed_chunk(parsed: dict):
+                    """处理单个已解析的 SSE chunk，yield Anthropic 事件"""
+                    nonlocal block_index, output_tokens, stop_reason
+                    nonlocal current_text_block_type, current_text_block_index
+                    nonlocal current_tc_index
 
-                        # ---- 文本 / 思考内容 ----
-                        content, content_type = extract_content_from_delta(delta, preserve_reasoning)
-                        if content and content_type:
-                            if current_text_block_type != content_type:
-                                if current_text_block_type is not None:
-                                    yield create_anthropic_content_block_stop(current_text_block_index).encode('utf-8')
-                                current_text_block_index = block_index
-                                block_index += 1
-                                yield create_anthropic_content_block_start(current_text_block_index, content_type).encode('utf-8')
-                                current_text_block_type = content_type
-                            output_tokens += len(content) // 4
-                            delta_type = "thinking_delta" if content_type == "thinking" else "text_delta"
-                            yield create_anthropic_content_block_delta(content, current_text_block_index, delta_type).encode('utf-8')
+                    choices = parsed.get("choices", [])
+                    if not choices:
+                        return
+                    choice = choices[0]
+                    delta = choice.get("delta", {})
+                    finish_reason = choice.get("finish_reason")
 
-                        # ---- 工具调用 ----
-                        tool_calls_delta = delta.get("tool_calls", [])
-                        for tc in tool_calls_delta:
-                            tc_index = tc.get("index", 0)
-                            tc_id = tc.get("id")
-                            tc_func = tc.get("function", {})
-                            tc_name = tc_func.get("name", "")
-                            tc_args = tc_func.get("arguments", "")
+                    # ---- 文本 / 思考内容 ----
+                    content, content_type = extract_content_from_delta(delta, preserve_reasoning)
+                    if content and content_type:
+                        if current_text_block_type != content_type:
+                            if current_text_block_type is not None:
+                                yield create_anthropic_content_block_stop(current_text_block_index).encode('utf-8')
+                            current_text_block_index = block_index
+                            block_index += 1
+                            yield create_anthropic_content_block_start(current_text_block_index, content_type).encode('utf-8')
+                            current_text_block_type = content_type
+                        output_tokens += len(content) // 4
+                        delta_type = "thinking_delta" if content_type == "thinking" else "text_delta"
+                        yield create_anthropic_content_block_delta(content, current_text_block_index, delta_type).encode('utf-8')
 
-                            if tc_index not in tool_call_block_map:
-                                # 关闭文本块（如果有）
-                                if current_text_block_type is not None:
-                                    yield create_anthropic_content_block_stop(current_text_block_index).encode('utf-8')
-                                    current_text_block_type = None
-                                # 关闭上一个工具调用块（如果有）
-                                if current_tc_index >= 0 and current_tc_index in tool_call_block_map:
-                                    yield create_anthropic_content_block_stop(
-                                        tool_call_block_map[current_tc_index]["block_index"]
-                                    ).encode('utf-8')
-                                # 开始新工具调用块
-                                tc_block_index = block_index
-                                block_index += 1
-                                tool_call_block_map[tc_index] = {
-                                    "block_index": tc_block_index,
-                                    "id": tc_id or f"toolu_{uuid.uuid4().hex[:24]}",
-                                    "name": tc_name or "",
-                                }
-                                current_tc_index = tc_index
-                                yield create_anthropic_tool_use_block_start(
-                                    tc_block_index,
-                                    tool_call_block_map[tc_index]["id"],
-                                    tool_call_block_map[tc_index]["name"],
+                    # ---- 工具调用 ----
+                    tool_calls_delta = delta.get("tool_calls", [])
+                    for tc in tool_calls_delta:
+                        tc_index = tc.get("index", 0)
+                        tc_id = tc.get("id")
+                        tc_func = tc.get("function", {})
+                        tc_name = tc_func.get("name", "")
+                        tc_args = tc_func.get("arguments", "")
+
+                        if tc_index not in tool_call_block_map:
+                            if current_text_block_type is not None:
+                                yield create_anthropic_content_block_stop(current_text_block_index).encode('utf-8')
+                                current_text_block_type = None
+                            if current_tc_index >= 0 and current_tc_index in tool_call_block_map:
+                                yield create_anthropic_content_block_stop(
+                                    tool_call_block_map[current_tc_index]["block_index"]
                                 ).encode('utf-8')
+                            tc_block_index = block_index
+                            block_index += 1
+                            tool_call_block_map[tc_index] = {
+                                "block_index": tc_block_index,
+                                "id": tc_id or f"toolu_{uuid.uuid4().hex[:24]}",
+                                "name": tc_name or "",
+                            }
+                            current_tc_index = tc_index
+                            yield create_anthropic_tool_use_block_start(
+                                tc_block_index,
+                                tool_call_block_map[tc_index]["id"],
+                                tool_call_block_map[tc_index]["name"],
+                            ).encode('utf-8')
 
-                            # 流式传输参数片段
-                            if tc_args:
-                                yield create_anthropic_input_json_delta(
-                                    tc_args, tool_call_block_map[tc_index]["block_index"]
-                                ).encode('utf-8')
+                        if tc_args:
+                            yield create_anthropic_input_json_delta(
+                                tc_args, tool_call_block_map[tc_index]["block_index"]
+                            ).encode('utf-8')
 
-                        # ---- finish_reason ----
-                        if finish_reason == "tool_calls":
-                            stop_reason = "tool_use"
-                        elif finish_reason == "stop":
-                            stop_reason = "end_turn"
-                        elif finish_reason == "length":
-                            stop_reason = "max_tokens"
+                    if finish_reason == "tool_calls":
+                        stop_reason = "tool_use"
+                    elif finish_reason == "stop":
+                        stop_reason = "end_turn"
+                    elif finish_reason == "length":
+                        stop_reason = "max_tokens"
 
+                try:
                     async for chunk in stream_gen:
                         if isinstance(chunk, str):
                             chunk_str = chunk
@@ -1550,7 +1581,6 @@ async def messages_anthropic(request: Request):
                                 async for evt in _process_parsed_chunk(parsed):
                                     yield evt
 
-                    # 处理剩余 buffer
                     for line in buffer.split("\n"):
                         if line.strip():
                             parsed = parse_openai_sse_chunk(line)
@@ -1558,22 +1588,24 @@ async def messages_anthropic(request: Request):
                                 async for evt in _process_parsed_chunk(parsed):
                                     yield evt
 
-                    # 关闭最后打开的文本块
                     if current_text_block_type is not None:
                         yield create_anthropic_content_block_stop(current_text_block_index).encode('utf-8')
 
-                    # 关闭最后打开的工具调用块
                     if current_tc_index >= 0 and current_tc_index in tool_call_block_map:
                         yield create_anthropic_content_block_stop(
                             tool_call_block_map[current_tc_index]["block_index"]
                         ).encode('utf-8')
 
-                    # 发送结束事件
                     yield create_anthropic_message_delta(stop_reason, output_tokens).encode('utf-8')
                     yield create_anthropic_message_stop().encode('utf-8')
+                except asyncio.CancelledError:
+                    logger.info("客户端取消 Anthropic 流式请求，立即释放账号令牌: %s", lease.account.id)
+                    raise
+                finally:
+                    await lease.close()
 
             return StreamingResponse(
-                generate_anthropic_stream_with_lock(),
+                generate_anthropic_stream_with_lease(),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -1582,11 +1614,24 @@ async def messages_anthropic(request: Request):
                 },
             )
         else:
-            # 非流式响应 - 转换为 Anthropic 格式
-            # 使用锁确保同一时间只有一个上游请求
-            async with _api_request_lock:
-                logger.debug("获取上游非流式响应 (Anthropic)...")
-                openai_result = await proxy.chat_completions(openai_body, stream=False)
+            try:
+                lease = await _acquire_upstream_lease()
+            except IFlowNotConfiguredError as e:
+                return JSONResponse(
+                    status_code=503,
+                    content={"type": "error", "error": {"type": "iflow_not_configured", "message": str(e)}}
+                )
+            except asyncio.TimeoutError:
+                return JSONResponse(
+                    status_code=429,
+                    content={"type": "error", "error": {"type": "rate_limit_exceeded", "message": "当前所有上游账号都在忙，请稍后重试"}}
+                )
+
+            try:
+                logger.debug("获取上游非流式响应 (Anthropic): account_id=%s", lease.account.id)
+                openai_result = await _run_nonstream_with_lease(lease, openai_body)
+            finally:
+                await lease.close()
             logger.debug("收到 OpenAI 格式响应: %s", json.dumps(openai_result, ensure_ascii=False)[:300])
             anthropic_result = openai_to_anthropic_response(openai_result, mapped_model)
             first_block = anthropic_result['content'][0] if anthropic_result['content'] else {}
@@ -1622,11 +1667,6 @@ async def messages_anthropic(request: Request):
 async def root_post(request: Request):
     """根路径 POST - 尝试自动检测格式"""
     try:
-        proxy = get_proxy()
-    except IFlowNotConfiguredError as e:
-        return create_error_response(503, str(e), "iflow_not_configured")
-    
-    try:
         body_bytes = await request.body()
         body = json.loads(body_bytes.decode("utf-8"))
         
@@ -1634,33 +1674,56 @@ async def root_post(request: Request):
         # 因为 CCR 主要使用 Anthropic 格式
         # 但为了安全起见，默认使用 OpenAI 格式
         stream = body.get("stream", False)
-        model = body.get("model", "unknown")
-        
         if stream:
-            # 流式响应 - 整个流式传输过程都在锁内进行
-            async def generate_with_lock():
-                """在锁内完成整个流式传输"""
-                async with _api_request_lock:
-                    logger.debug("获取上游流式响应 (root_post)...")
-                    stream_gen = await proxy.chat_completions(body, stream=True)
-                    chunk_count = 0
-                    try:
-                        async for chunk in stream_gen:
-                            chunk_count += 1
-                            yield chunk
-                    finally:
-                        logger.debug("流式完成 (root_post): 共 %d chunks", chunk_count)
+            try:
+                lease = await _acquire_upstream_lease()
+            except IFlowNotConfiguredError as e:
+                return create_error_response(503, str(e), "iflow_not_configured")
+            except asyncio.TimeoutError:
+                return create_error_response(429, "当前所有上游账号都在忙，请稍后重试", "rate_limit_exceeded")
+
+            try:
+                stream_gen = await lease.proxy.chat_completions(
+                    body,
+                    stream=True,
+                    apply_concurrency_limit=False,
+                )
+            except Exception as e:
+                await lease.close()
+                return _map_upstream_exception(e)
+
+            async def generate_with_lease():
+                """持有账号租约直到整个流式传输结束。"""
+                chunk_count = 0
+                try:
+                    async for chunk in stream_gen:
+                        chunk_count += 1
+                        yield chunk
+                except asyncio.CancelledError:
+                    logger.info("客户端取消 root 流式请求，立即释放账号令牌: %s", lease.account.id)
+                    raise
+                finally:
+                    logger.debug("流式完成 (root_post): account=%s, chunks=%d", lease.account.id, chunk_count)
+                    await lease.close()
             
             return StreamingResponse(
-                generate_with_lock(),
+                generate_with_lease(),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
         else:
-            # 使用锁确保同一时间只有一个上游请求
-            async with _api_request_lock:
-                logger.debug("获取上游非流式响应 (root_post)...")
-                result = await proxy.chat_completions(body, stream=False)
+            try:
+                lease = await _acquire_upstream_lease()
+            except IFlowNotConfiguredError as e:
+                return create_error_response(503, str(e), "iflow_not_configured")
+            except asyncio.TimeoutError:
+                return create_error_response(429, "当前所有上游账号都在忙，请稍后重试", "rate_limit_exceeded")
+
+            try:
+                logger.debug("获取上游非流式响应 (root_post): account_id=%s", lease.account.id)
+                result = await _run_nonstream_with_lease(lease, body)
+            finally:
+                await lease.close()
             # 验证响应包含有效的 choices
             if not result.get("choices"):
                 logger.error("API 响应缺少 choices 数组 (root_post): %s", json.dumps(result, ensure_ascii=False)[:500])

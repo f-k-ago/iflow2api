@@ -4,16 +4,90 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
-
-logger = logging.getLogger("iflow2api")
 
 from .config import load_iflow_config, save_iflow_config, IFlowConfig
 from .crypto import ConfigEncryption
 from .autostart import set_auto_start as _set_auto_start
 from .autostart import get_auto_start as _get_auto_start
+
+logger = logging.getLogger("iflow2api")
+
+
+DEFAULT_BASE_URL = "https://apis.iflow.cn/v1"
+
+
+class UpstreamAccount(BaseModel):
+    """上游账号池中的单个账号。"""
+
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    label: str = ""
+    enabled: bool = True
+    auth_type: str = "api-key"
+    api_key: str = ""
+    base_url: str = DEFAULT_BASE_URL
+    oauth_access_token: str = ""
+    oauth_refresh_token: str = ""
+    oauth_expires_at: Optional[str] = None
+    cookie: str = ""
+    cookie_email: str = ""
+    cookie_expires_at: Optional[str] = None
+    email: str = ""
+    phone: str = ""
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _normalize_account(account: UpstreamAccount) -> UpstreamAccount:
+    """规范化账号字段，保证后续逻辑只面对一种形状。"""
+    if not account.id:
+        account.id = uuid4().hex
+
+    account.label = (account.label or "").strip()
+    account.auth_type = ((account.auth_type or "api-key").strip() or "api-key")
+    account.api_key = (account.api_key or "").strip()
+    account.base_url = (account.base_url or DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
+    account.oauth_access_token = (account.oauth_access_token or "").strip()
+    account.oauth_refresh_token = (account.oauth_refresh_token or "").strip()
+    account.cookie = (account.cookie or "").strip()
+    account.cookie_email = (account.cookie_email or "").strip()
+    account.email = (account.email or "").strip()
+    account.phone = (account.phone or "").strip()
+
+    if account.auth_type == "cookie" and not account.email and account.cookie_email:
+        account.email = account.cookie_email
+
+    if not account.created_at:
+        account.created_at = _now_iso()
+    if not account.updated_at:
+        account.updated_at = account.created_at
+
+    if not account.label:
+        if account.email:
+            account.label = account.email
+        elif account.phone:
+            account.label = account.phone
+        elif account.auth_type == "api-key" and account.api_key:
+            account.label = f"API Key {account.api_key[-4:]}"
+        else:
+            account.label = f"{account.auth_type}-{account.id[:6]}"
+
+    return account
+
+
+def _account_has_credentials(account: UpstreamAccount) -> bool:
+    return bool(
+        (account.api_key or "").strip()
+        or (account.oauth_access_token or "").strip()
+        or (account.cookie or "").strip()
+    )
 
 
 class AppSettings(BaseModel):
@@ -30,7 +104,7 @@ class AppSettings(BaseModel):
 
     # iFlow 配置 (从 ~/.iflow/settings.json 读取)
     api_key: str = ""
-    base_url: str = "https://apis.iflow.cn/v1"
+    base_url: str = DEFAULT_BASE_URL
 
     # OAuth 配置 (从 ~/.iflow/settings.json 读取)
     auth_type: str = "api-key"
@@ -87,6 +161,170 @@ class AppSettings(BaseModel):
     # - curl_cffi: 使用 curl-impersonate，可伪装为 Chrome/Node 风格握手
     upstream_transport_backend: str = "curl_cffi"
     tls_impersonate: str = "chrome124"
+
+    # 多账号池配置
+    primary_account_id: str = ""
+    upstream_accounts: list[UpstreamAccount] = Field(default_factory=list)
+
+
+def build_legacy_account(settings: AppSettings) -> Optional[UpstreamAccount]:
+    """从旧单账号字段构造兼容账号。"""
+    if not any(
+        [
+            (settings.api_key or "").strip(),
+            (settings.oauth_access_token or "").strip(),
+            (settings.cookie or "").strip(),
+        ]
+    ):
+        return None
+
+    return _normalize_account(
+        UpstreamAccount(
+            id="legacy-primary",
+            label="兼容主账号",
+            enabled=True,
+            auth_type=(settings.auth_type or "api-key"),
+            api_key=settings.api_key,
+            base_url=settings.base_url,
+            oauth_access_token=settings.oauth_access_token,
+            oauth_refresh_token=settings.oauth_refresh_token,
+            oauth_expires_at=settings.oauth_expires_at,
+            cookie=settings.cookie,
+            cookie_email=settings.cookie_email,
+            cookie_expires_at=settings.cookie_expires_at,
+            email=settings.cookie_email,
+        )
+    )
+
+
+def list_upstream_accounts(settings: AppSettings) -> list[UpstreamAccount]:
+    """返回当前设置中的账号列表；无池配置时回退到旧单账号字段。"""
+    if settings.upstream_accounts:
+        return [_normalize_account(account) for account in settings.upstream_accounts]
+
+    legacy_account = build_legacy_account(settings)
+    return [legacy_account] if legacy_account else []
+
+
+def get_primary_account(settings: AppSettings, include_disabled: bool = False) -> Optional[UpstreamAccount]:
+    """获取主账号，供兼容层和信息展示使用。"""
+    accounts = list_upstream_accounts(settings)
+    if not accounts:
+        return None
+
+    accounts_by_id = {account.id: account for account in accounts}
+    if settings.primary_account_id:
+        account = accounts_by_id.get(settings.primary_account_id)
+        if account and (include_disabled or account.enabled):
+            return account
+
+    for account in accounts:
+        if include_disabled or account.enabled:
+            return account
+
+    return accounts[0]
+
+
+def get_enabled_upstream_accounts(settings: AppSettings) -> list[UpstreamAccount]:
+    """返回可参与调度的账号。"""
+    return [
+        account
+        for account in list_upstream_accounts(settings)
+        if account.enabled and _account_has_credentials(account) and account.api_key
+    ]
+
+
+def sync_legacy_auth_fields(settings: AppSettings) -> AppSettings:
+    """把主账号同步回旧单账号字段，保证旧代码路径继续工作。"""
+    primary_account = get_primary_account(settings)
+    if not primary_account:
+        if settings.upstream_accounts:
+            settings.primary_account_id = ""
+            settings.api_key = ""
+            settings.base_url = DEFAULT_BASE_URL
+            settings.auth_type = "api-key"
+            settings.oauth_access_token = ""
+            settings.oauth_refresh_token = ""
+            settings.oauth_expires_at = None
+            settings.cookie = ""
+            settings.cookie_email = ""
+            settings.cookie_expires_at = None
+        return settings
+
+    settings.primary_account_id = primary_account.id
+    settings.api_key = primary_account.api_key
+    settings.base_url = primary_account.base_url
+    settings.auth_type = primary_account.auth_type
+    settings.oauth_access_token = primary_account.oauth_access_token
+    settings.oauth_refresh_token = primary_account.oauth_refresh_token
+    settings.oauth_expires_at = primary_account.oauth_expires_at
+    settings.cookie = primary_account.cookie
+    settings.cookie_email = primary_account.cookie_email or primary_account.email
+    settings.cookie_expires_at = primary_account.cookie_expires_at
+    return settings
+
+
+def upsert_upstream_account(
+    settings: AppSettings,
+    account: UpstreamAccount,
+    *,
+    make_primary: bool = True,
+) -> UpstreamAccount:
+    """新增或更新账号池中的账号。"""
+    normalized = _normalize_account(account)
+    now = _now_iso()
+    normalized.updated_at = now
+    if not normalized.created_at:
+        normalized.created_at = now
+
+    match_index = -1
+    for index, existing in enumerate(settings.upstream_accounts):
+        if normalized.id and existing.id == normalized.id:
+            match_index = index
+            break
+        if normalized.auth_type == "oauth-iflow" and normalized.oauth_refresh_token:
+            if existing.oauth_refresh_token and existing.oauth_refresh_token == normalized.oauth_refresh_token:
+                match_index = index
+                break
+        if normalized.auth_type == "cookie" and normalized.cookie:
+            if existing.cookie and existing.cookie == normalized.cookie:
+                match_index = index
+                break
+        if normalized.api_key and existing.api_key and existing.api_key == normalized.api_key:
+            match_index = index
+            break
+
+    if match_index >= 0:
+        existing = _normalize_account(settings.upstream_accounts[match_index])
+        created_at = existing.created_at
+        merged = existing.model_copy(update=normalized.model_dump())
+        merged.created_at = created_at or normalized.created_at or now
+        merged.updated_at = now
+        settings.upstream_accounts[match_index] = _normalize_account(merged)
+        saved_account = settings.upstream_accounts[match_index]
+    else:
+        normalized.created_at = normalized.created_at or now
+        normalized.updated_at = now
+        settings.upstream_accounts.append(normalized)
+        saved_account = normalized
+
+    if make_primary:
+        settings.primary_account_id = saved_account.id
+
+    sync_legacy_auth_fields(settings)
+    return saved_account
+
+
+def remove_upstream_account(settings: AppSettings, account_id: str) -> bool:
+    """从账号池中删除账号。"""
+    original_count = len(settings.upstream_accounts)
+    settings.upstream_accounts = [account for account in settings.upstream_accounts if account.id != account_id]
+    removed = len(settings.upstream_accounts) != original_count
+    if removed:
+        if settings.primary_account_id == account_id:
+            settings.primary_account_id = ""
+        sync_legacy_auth_fields(settings)
+    return removed
 
 
 # lazy singleton for token encryption
@@ -154,6 +392,25 @@ def load_settings() -> AppSettings:
                     settings.api_key = data["api_key"]
                 if "base_url" in data:
                     settings.base_url = data["base_url"]
+                if "primary_account_id" in data:
+                    settings.primary_account_id = data["primary_account_id"]
+                if "upstream_accounts" in data and isinstance(data["upstream_accounts"], list):
+                    loaded_accounts: list[UpstreamAccount] = []
+                    for raw_account in data["upstream_accounts"]:
+                        if not isinstance(raw_account, dict):
+                            continue
+                        account_data: dict[str, Any] = dict(raw_account)
+                        if "oauth_access_token" in account_data:
+                            account_data["oauth_access_token"] = _decrypt_token(account_data["oauth_access_token"])
+                        if "oauth_refresh_token" in account_data:
+                            account_data["oauth_refresh_token"] = _decrypt_token(account_data["oauth_refresh_token"])
+                        if "cookie" in account_data:
+                            account_data["cookie"] = _decrypt_token(account_data["cookie"])
+                        try:
+                            loaded_accounts.append(_normalize_account(UpstreamAccount(**account_data)))
+                        except Exception as account_error:
+                            logger.warning("读取上游账号配置失败，已跳过: %s", account_error)
+                    settings.upstream_accounts = loaded_accounts
                 if "auto_start" in data:
                     settings.auto_start = data["auto_start"]
                 if "start_minimized" in data:
@@ -242,6 +499,9 @@ def load_settings() -> AppSettings:
         except Exception as _e:
             logger.warning("从 iFlow 配置加载失败: %s", _e)
 
+    if settings.upstream_accounts:
+        sync_legacy_auth_fields(settings)
+
     return settings
 
 
@@ -255,6 +515,16 @@ def save_settings(settings: AppSettings) -> None:
     # 1. 保存所有设置到 ~/.iflow2api/config.json
     config_dir = get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
+    settings.upstream_accounts = [_normalize_account(account) for account in settings.upstream_accounts]
+    sync_legacy_auth_fields(settings)
+
+    serialized_accounts = []
+    for account in settings.upstream_accounts:
+        serialized = account.model_dump()
+        serialized["oauth_access_token"] = _encrypt_token(account.oauth_access_token)
+        serialized["oauth_refresh_token"] = _encrypt_token(account.oauth_refresh_token)
+        serialized["cookie"] = _encrypt_token(account.cookie)
+        serialized_accounts.append(serialized)
 
     app_data = {
         "host": settings.host,
@@ -262,6 +532,8 @@ def save_settings(settings: AppSettings) -> None:
         # iFlow 配置也保存到 iflow2api/config.json
         "api_key": settings.api_key,
         "base_url": settings.base_url,
+        "primary_account_id": settings.primary_account_id,
+        "upstream_accounts": serialized_accounts,
         # OAuth 配置
         "auth_type": settings.auth_type,
         "oauth_access_token": _encrypt_token(settings.oauth_access_token),

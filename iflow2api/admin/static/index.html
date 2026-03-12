@@ -193,7 +193,30 @@
                                 <tr id="account-cookie-expire-row" style="display: none;">
                                     <td>Cookie 到期</td>
                                     <td id="account-cookie-expire">--</td>
-                                </tr></table>
+                                </tr>
+                                <tr>
+                                    <td>账号总数</td>
+                                    <td id="account-total">0</td>
+                                </tr>
+                                <tr>
+                                    <td>启用账号</td>
+                                    <td id="account-enabled-total">0</td>
+                                </tr>
+                            </table>
+                            <div class="form-group" style="margin-top: 16px;">
+                                <label>账号池</label>
+                                <table class="info-table" id="account-list-table">
+                                    <thead>
+                                        <tr>
+                                            <th>备注</th>
+                                            <th>类型</th>
+                                            <th>凭据</th>
+                                            <th>状态</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody></tbody>
+                                </table>
+                            </div>
                         </div>
                     </div>
                 </section>
@@ -204,22 +227,43 @@
                     <div class="card">
                         <div class="card-header">
                             <span class="icon">🔑</span>
-                            <span>iFlow 配置</span>
+                            <span>账号池与登录</span>
                         </div>
                         <div class="card-body">
                             <form id="iflow-settings-form">
                                 <div class="form-group">
+                                    <label for="setting-account-label">账号备注</label>
+                                    <input type="text" id="setting-account-label" name="account_label" placeholder="可选，留空会自动生成">
+                                </div>
+                                <div class="form-group">
                                     <label for="setting-api-key">API Key</label>
-                                    <input type="password" id="setting-api-key" name="api_key" placeholder="输入 API Key">
+                                    <input type="password" id="setting-api-key" name="api_key" placeholder="用于新增 API Key 账号">
                                 </div>
                                 <div class="form-group">
                                     <label for="setting-base-url">Base URL</label>
                                     <input type="text" id="setting-base-url" name="base_url" placeholder="https://apis.iflow.cn/v1">
                                 </div>
                                 <div class="form-row">
+                                    <button type="button" id="add-api-account-btn" class="btn btn-primary">添加 API Key 账号</button>
                                     <button type="button" id="import-cli-btn" class="btn btn-secondary">从 iFlow CLI 导入</button>
-                                    <button type="button" id="oauth-login-btn" class="btn btn-primary">OAuth 登录</button>
+                                    <button type="button" id="oauth-login-btn" class="btn btn-secondary">OAuth 登录</button>
                                     <button type="button" id="cookie-login-btn" class="btn btn-secondary">Cookie 登录</button>
+                                </div>
+                                <p class="hint">这里的 API Key 表单只用于新增账号，不会在“保存设置”时覆盖现有账号。OAuth、Cookie、CLI 导入都会直接写入账号池。</p>
+                                <div class="form-group" style="margin-top: 20px;">
+                                    <label>已配置账号</label>
+                                    <table class="info-table" id="upstream-accounts-table">
+                                        <thead>
+                                            <tr>
+                                                <th>备注</th>
+                                                <th>类型</th>
+                                                <th>凭据</th>
+                                                <th>状态</th>
+                                                <th>操作</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody></tbody>
+                                    </table>
                                 </div>
                             </form>
                         </div>
@@ -491,64 +535,6 @@
         </div>
     </div>
 
-    <script src="/admin/static/js/app.js">// Cookie 登录处理
-        const cookieSubmitBtn = document.getElementById('cookie-submit-btn');
-        const cookieInput = document.getElementById('cookie-input');
-        const cookieStatus = document.getElementById('cookie-status');
-
-        if (cookieSubmitBtn) {
-            cookieSubmitBtn.addEventListener('click', async () => {
-                const cookie = cookieInput.value.trim();
-
-                if (!cookie) {
-                    cookieStatus.textContent = '请输入 Cookie';
-                    cookieStatus.style.color = 'red';
-                    return;
-                }
-
-                if (!cookie.includes('BXAuth=')) {
-                    cookieStatus.textContent = 'Cookie 必须包含 BXAuth 字段';
-                    cookieStatus.style.color = 'red';
-                    return;
-                }
-
-                cookieStatus.textContent = '正在登录...';
-                cookieStatus.style.color = 'blue';
-                cookieSubmitBtn.disabled = true;
-
-                try {
-                    const response = await fetch('/admin/cookie/login', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json','Authorization': `Bearer ${localStorage.getItem('token')}`
-                        },
-                        body: JSON.stringify({ cookie })
-                    });
-
-                    const result = await response.json();
-
-                    if (result.success) {
-                        cookieStatus.textContent = 'Cookie 登录成功！正在刷新配置...';
-                        cookieStatus.style.color = 'green';
-
-                        // 清空输入
-                        cookieInput.value = '';
-
-                        // 刷新设置
-                        setTimeout(() => {
-                            loadSettings();
-                            cookieStatus.textContent = '';}, 2000);
-                    } else {
-                        cookieStatus.textContent = `登录失败: ${result.message}`;
-                        cookieStatus.style.color = 'red';
-                    }
-                } catch (error) {
-                    cookieStatus.textContent = `登录失败: ${error.message}`;
-                    cookieStatus.style.color = 'red';
-                } finally {
-                    cookieSubmitBtn.disabled = false;
-                }
-            });
-        }</script>
+    <script src="/admin/static/js/app.js"></script>
 </body>
 </html>

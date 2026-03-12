@@ -74,6 +74,20 @@ class CookieLoginRequest(BaseModel):
     cookie: str
 
 
+class UpstreamAccountCreateRequest(BaseModel):
+    """新增上游账号请求。"""
+
+    label: Optional[str] = None
+    api_key: str
+    base_url: Optional[str] = None
+
+
+class UpstreamAccountToggleRequest(BaseModel):
+    """启停上游账号请求。"""
+
+    enabled: bool
+
+
 # 认证依赖
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
@@ -317,83 +331,63 @@ def _mask_secret(value: str, head: int = 8, tail: int = 4) -> str:
     return f"{raw[:head]}...{raw[-tail:]}"
 
 
-@admin_router.get("/account-info")
-async def get_account_info(username: str = Depends(get_current_user)) -> dict[str, Any]:
-    """获取当前登录的账号信息"""
-    from ..settings import load_settings
-    from ..oauth import IFlowOAuth
-    from ..config import load_iflow_config
+def _serialize_upstream_account(account, *, primary_account_id: str) -> dict[str, Any]:
+    """序列化账号池条目给前端使用。"""
+    from ..concurrency_limiter import get_concurrency_limiter
+    from ..settings import DEFAULT_BASE_URL
 
-    settings = load_settings()
-    api_key = (settings.api_key or "").strip()
-    auth_type = (settings.auth_type or "").strip()
-    oauth_access_token = (settings.oauth_access_token or "").strip()
-    cookie = (settings.cookie or "").strip()
-    cookie_email = (settings.cookie_email or "").strip()
-    cookie_expires_at = settings.cookie_expires_at
-
-    # 兼容：如果应用配置未同步到位，回退到 ~/.iflow/settings.json 读取
-    try:
-        iflow_config = load_iflow_config()
-    except Exception:
-        iflow_config = None
-
-    if iflow_config:
-        if not api_key and iflow_config.api_key:
-            api_key = iflow_config.api_key.strip()
-        if auth_type in ("", "api-key") and iflow_config.auth_type in ("oauth-iflow", "cookie"):
-            auth_type = iflow_config.auth_type
-        if not oauth_access_token and iflow_config.oauth_access_token:
-            oauth_access_token = iflow_config.oauth_access_token.strip()
-        if not cookie and iflow_config.cookie:
-            cookie = iflow_config.cookie.strip()
-        if not cookie_email and iflow_config.cookie_email:
-            cookie_email = iflow_config.cookie_email.strip()
-        if not cookie_expires_at and iflow_config.cookie_expires_at:
-            cookie_expires_at = iflow_config.cookie_expires_at
-
-    # 若配置中的 auth_type 不可信，按现有凭据推断
-    if auth_type not in ("oauth-iflow", "cookie", "api-key"):
-        if oauth_access_token:
-            auth_type = "oauth-iflow"
-        elif cookie:
-            auth_type = "cookie"
-        elif api_key:
-            auth_type = "api-key"
-        else:
-            auth_type = "not_logged_in"
-
-    if auth_type == "api-key" and not api_key and (oauth_access_token or cookie):
-        auth_type = "oauth-iflow" if oauth_access_token else "cookie"
-
-    if not api_key and not oauth_access_token and not cookie:
-        auth_type = "not_logged_in"
-
-    account_info = {
-        "auth_type": auth_type,
-        "has_api_key": bool(api_key),
-        "api_key_masked": _mask_secret(api_key),
+    stats = get_concurrency_limiter().get_stats(account.id)
+    return {
+        "id": account.id,
+        "label": account.label,
+        "enabled": account.enabled,
+        "is_primary": account.id == primary_account_id,
+        "auth_type": account.auth_type,
+        "api_key_masked": _mask_secret(account.api_key),
+        "base_url": account.base_url or DEFAULT_BASE_URL,
+        "email": account.email or account.cookie_email,
+        "phone": account.phone,
+        "cookie_expires_at": account.cookie_expires_at,
+        "created_at": account.created_at,
+        "updated_at": account.updated_at,
+        "stats": stats,
     }
 
-    # Cookie 模式直接返回已保存的账号信息
-    if auth_type == "cookie":
-        if cookie_email:
-            account_info["email"] = cookie_email
-        if cookie_expires_at:
-            account_info["cookie_expires_at"] = cookie_expires_at
 
-    # OAuth 模式尝试实时拉取用户信息
-    if auth_type == "oauth-iflow" and oauth_access_token:
-        try:
-            oauth = IFlowOAuth()
-            user_info = await oauth.get_user_info(oauth_access_token)
-            account_info["email"] = user_info.get("email", "")
-            account_info["phone"] = user_info.get("phone", "")
-        except Exception:
-            # 拉取失败时回退到本地已知信息
-            if cookie_email and not account_info.get("email"):
-                account_info["email"] = cookie_email
+@admin_router.get("/account-info")
+async def get_account_info(username: str = Depends(get_current_user)) -> dict[str, Any]:
+    """获取账号池概览与主账号信息。"""
+    from ..settings import get_enabled_upstream_accounts, get_primary_account, list_upstream_accounts, load_settings
 
+    settings = load_settings()
+    accounts = list_upstream_accounts(settings)
+    primary_account = get_primary_account(settings, include_disabled=True)
+
+    if not accounts or primary_account is None:
+        return {
+            "auth_type": "not_logged_in",
+            "has_api_key": False,
+            "api_key_masked": "",
+            "accounts": [],
+            "total_accounts": 0,
+            "enabled_accounts": 0,
+        }
+
+    account_info = {
+        "auth_type": primary_account.auth_type or "not_logged_in",
+        "has_api_key": bool((primary_account.api_key or "").strip()),
+        "api_key_masked": _mask_secret(primary_account.api_key),
+        "email": primary_account.email or primary_account.cookie_email,
+        "phone": primary_account.phone,
+        "cookie_expires_at": primary_account.cookie_expires_at,
+        "accounts": [
+            _serialize_upstream_account(account, primary_account_id=settings.primary_account_id)
+            for account in accounts
+        ],
+        "total_accounts": len(accounts),
+        "enabled_accounts": len(get_enabled_upstream_accounts(settings)),
+        "primary_account_id": settings.primary_account_id,
+    }
     return account_info
 
 
@@ -421,6 +415,7 @@ async def get_settings(username: str = Depends(get_current_user)) -> dict[str, A
         # 上游代理设置
         "upstream_proxy": settings.upstream_proxy,
         "upstream_proxy_enabled": settings.upstream_proxy_enabled,
+        "primary_account_id": settings.primary_account_id,
         # 不返回 OAuth 敏感信息
     }
 
@@ -431,7 +426,7 @@ async def update_settings(
     username: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """更新应用设置"""
-    from ..settings import load_settings, save_settings
+    from ..settings import get_primary_account, load_settings, save_settings, upsert_upstream_account
     
     settings = load_settings()
     
@@ -460,9 +455,21 @@ async def update_settings(
     if request.language is not None:
         settings.language = request.language
     if request.api_key is not None:
-        settings.api_key = request.api_key
+        if settings.upstream_accounts:
+            primary_account = get_primary_account(settings, include_disabled=True)
+            if primary_account and request.api_key.strip():
+                primary_account.api_key = request.api_key.strip()
+                upsert_upstream_account(settings, primary_account, make_primary=True)
+        else:
+            settings.api_key = request.api_key
     if request.base_url is not None:
-        settings.base_url = request.base_url
+        if settings.upstream_accounts:
+            primary_account = get_primary_account(settings, include_disabled=True)
+            if primary_account and request.base_url.strip():
+                primary_account.base_url = request.base_url.strip()
+                upsert_upstream_account(settings, primary_account, make_primary=True)
+        else:
+            settings.base_url = request.base_url
     if request.custom_api_key is not None:
         settings.custom_api_key = request.custom_api_key
     if request.custom_auth_header is not None:
@@ -481,26 +488,186 @@ async def update_settings(
         "type": "settings_updated",
         "timestamp": datetime.now().isoformat(),
     })
+
+    from ..app import reload_proxy
+
+    reload_proxy()
     
     return {"success": True, "message": "设置已保存"}
 
 
 # ==================== iFlow 配置 ====================
 
+@admin_router.get("/upstream-accounts")
+async def get_upstream_accounts(username: str = Depends(get_current_user)) -> dict[str, Any]:
+    """获取上游账号池列表。"""
+    from ..settings import list_upstream_accounts, load_settings
+
+    settings = load_settings()
+    accounts = list_upstream_accounts(settings)
+    return {
+        "accounts": [
+            _serialize_upstream_account(account, primary_account_id=settings.primary_account_id)
+            for account in accounts
+        ],
+        "primary_account_id": settings.primary_account_id,
+    }
+
+
+@admin_router.post("/upstream-accounts")
+async def create_upstream_account(
+    request: UpstreamAccountCreateRequest,
+    username: str = Depends(get_current_user),
+) -> dict[str, Any]:
+    """手动新增 API Key 账号。"""
+    from ..settings import DEFAULT_BASE_URL, UpstreamAccount, load_settings, save_settings, upsert_upstream_account
+
+    settings = load_settings()
+    account = UpstreamAccount(
+        label=(request.label or "").strip() or "",
+        auth_type="api-key",
+        api_key=request.api_key.strip(),
+        base_url=(request.base_url or settings.base_url or DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL,
+    )
+    saved_account = upsert_upstream_account(settings, account, make_primary=not settings.primary_account_id)
+    save_settings(settings)
+
+    from ..app import reload_proxy
+
+    reload_proxy()
+    return {
+        "success": True,
+        "message": "账号已添加到账号池",
+        "account": _serialize_upstream_account(saved_account, primary_account_id=settings.primary_account_id),
+    }
+
+
+@admin_router.patch("/upstream-accounts/{account_id}/enabled")
+async def toggle_upstream_account(
+    account_id: str,
+    request: UpstreamAccountToggleRequest,
+    username: str = Depends(get_current_user),
+) -> dict[str, Any]:
+    """启用或停用上游账号。"""
+    from ..settings import build_legacy_account, load_settings, save_settings
+
+    settings = load_settings()
+    if not settings.upstream_accounts and account_id == "legacy-primary":
+        legacy_account = build_legacy_account(settings)
+        if legacy_account is None:
+            raise HTTPException(status_code=404, detail="账号不存在")
+        legacy_account.enabled = request.enabled
+        settings.upstream_accounts = [legacy_account]
+
+    for account in settings.upstream_accounts:
+        if account.id == account_id:
+            account.enabled = request.enabled
+            save_settings(settings)
+            from ..app import reload_proxy
+
+            reload_proxy()
+            return {"success": True, "message": "账号状态已更新"}
+
+    raise HTTPException(status_code=404, detail="账号不存在")
+
+
+@admin_router.post("/upstream-accounts/{account_id}/activate")
+async def activate_upstream_account(
+    account_id: str,
+    username: str = Depends(get_current_user),
+) -> dict[str, Any]:
+    """切换兼容层主账号。"""
+    from ..settings import build_legacy_account, load_settings, save_settings
+
+    settings = load_settings()
+    if not settings.upstream_accounts and account_id == "legacy-primary":
+        legacy_account = build_legacy_account(settings)
+        if legacy_account is None:
+            raise HTTPException(status_code=404, detail="账号不存在")
+        settings.upstream_accounts = [legacy_account]
+    if settings.upstream_accounts and not any(account.id == account_id for account in settings.upstream_accounts):
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    settings.primary_account_id = account_id
+    save_settings(settings)
+
+    from ..app import reload_proxy
+
+    reload_proxy()
+    return {"success": True, "message": "主账号已切换"}
+
+
+@admin_router.delete("/upstream-accounts/{account_id}")
+async def delete_upstream_account(
+    account_id: str,
+    username: str = Depends(get_current_user),
+) -> dict[str, Any]:
+    """删除上游账号。"""
+    from ..settings import DEFAULT_BASE_URL, load_settings, remove_upstream_account, save_settings
+
+    settings = load_settings()
+    if not settings.upstream_accounts and account_id == "legacy-primary":
+        settings.primary_account_id = ""
+        settings.api_key = ""
+        settings.base_url = DEFAULT_BASE_URL
+        settings.auth_type = "api-key"
+        settings.oauth_access_token = ""
+        settings.oauth_refresh_token = ""
+        settings.oauth_expires_at = None
+        settings.cookie = ""
+        settings.cookie_email = ""
+        settings.cookie_expires_at = None
+        save_settings(settings)
+        from ..app import reload_proxy
+
+        reload_proxy()
+        return {"success": True, "message": "账号已删除"}
+
+    if not remove_upstream_account(settings, account_id):
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    save_settings(settings)
+
+    from ..app import reload_proxy
+
+    reload_proxy()
+    return {"success": True, "message": "账号已删除"}
+
 @admin_router.post("/import-from-cli")
 async def import_from_cli(
     username: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """从 iFlow CLI 导入配置"""
-    from ..settings import import_from_iflow_cli
+    from ..settings import UpstreamAccount, import_from_iflow_cli, load_settings, save_settings, upsert_upstream_account
     
     config = import_from_iflow_cli()
     if config:
+        settings = load_settings()
+        account = UpstreamAccount(
+            label="iFlow CLI 导入",
+            auth_type=(config.auth_type or "api-key"),
+            api_key=config.api_key,
+            base_url=config.base_url,
+            oauth_access_token=config.oauth_access_token or "",
+            oauth_refresh_token=config.oauth_refresh_token or "",
+            oauth_expires_at=config.oauth_expires_at.isoformat() if config.oauth_expires_at else None,
+            cookie=config.cookie or "",
+            cookie_email=config.cookie_email or "",
+            cookie_expires_at=config.cookie_expires_at,
+            email=config.cookie_email or "",
+        )
+        saved_account = upsert_upstream_account(settings, account, make_primary=not settings.primary_account_id)
+        save_settings(settings)
+
+        from ..app import reload_proxy
+
+        reload_proxy()
         return {
             "success": True,
-            "message": "已从 iFlow CLI 导入配置",
+            "message": "已从 iFlow CLI 导入到账号池",
             "api_key": config.api_key,
             "base_url": config.base_url,
+            "account": _serialize_upstream_account(saved_account, primary_account_id=settings.primary_account_id),
         }
     else:
         raise HTTPException(
@@ -621,7 +788,7 @@ async def cookie_login(
 ) -> dict[str, Any]:
     """使用 BXAuth Cookie 登录"""
     from ..oauth import IFlowOAuth
-    from ..settings import load_settings, save_settings
+    from ..settings import UpstreamAccount, load_settings, save_settings, upsert_upstream_account
 
     oauth = IFlowOAuth()
 
@@ -639,17 +806,18 @@ async def cookie_login(
                 "message": "获取 API Key 失败"
             }
 
-        # 保存到配置
         settings = load_settings()
-        settings.api_key = api_key
-        settings.auth_type = "cookie"
-        settings.cookie = IFlowOAuth.cookie_for_storage(request.cookie)
-        settings.cookie_email = resolved_email.strip()
-        settings.cookie_expires_at = expired or None
-        # 切换到 Cookie 模式时清理 OAuth 凭据，避免状态漂移
-        settings.oauth_access_token = ""
-        settings.oauth_refresh_token = ""
-        settings.oauth_expires_at = None
+        account = UpstreamAccount(
+            label=resolved_email.strip() or "Cookie 账号",
+            auth_type="cookie",
+            api_key=api_key,
+            base_url=settings.base_url,
+            cookie=IFlowOAuth.cookie_for_storage(request.cookie),
+            cookie_email=resolved_email.strip(),
+            cookie_expires_at=expired or None,
+            email=resolved_email.strip(),
+        )
+        saved_account = upsert_upstream_account(settings, account, make_primary=True)
         save_settings(settings)
 
         # 重新加载代理实例
@@ -660,6 +828,7 @@ async def cookie_login(
             "success": True,
             "message": "Cookie 登录成功",
             "data": {
+                "account_id": saved_account.id,
                 "expired": expired,
                 "email": resolved_email,
             }
@@ -685,7 +854,7 @@ async def oauth_callback(
 ) -> dict[str, Any]:
     """处理 OAuth 回调（POST 请求 - 从前端发送）"""
     from ..oauth import IFlowOAuth
-    from ..settings import load_settings, save_settings
+    from ..settings import UpstreamAccount, load_settings, save_settings, upsert_upstream_account
 
     settings = load_settings()
     oauth = IFlowOAuth()
@@ -712,19 +881,19 @@ async def oauth_callback(
         if not api_key:
             raise HTTPException(status_code=400, detail="无法获取 API Key")
         
-        # 保存配置
         settings = load_settings()
-        settings.api_key = api_key
-        settings.auth_type = "oauth-iflow"
-        settings.oauth_access_token = access_token
-        if token_data.get("refresh_token"):
-            settings.oauth_refresh_token = token_data["refresh_token"]
-        if token_data.get("expires_at"):
-            settings.oauth_expires_at = token_data["expires_at"].isoformat()
-        # 切换到 OAuth 模式时清理 Cookie 凭据
-        settings.cookie = ""
-        settings.cookie_email = ""
-        settings.cookie_expires_at = None
+        account = UpstreamAccount(
+            label=(user_info.get("email") or user_info.get("phone") or "OAuth 账号").strip(),
+            auth_type="oauth-iflow",
+            api_key=api_key,
+            base_url=settings.base_url,
+            oauth_access_token=access_token,
+            oauth_refresh_token=token_data.get("refresh_token", "") or "",
+            oauth_expires_at=token_data["expires_at"].isoformat() if token_data.get("expires_at") else None,
+            email=(user_info.get("email") or "").strip(),
+            phone=(user_info.get("phone") or "").strip(),
+        )
+        saved_account = upsert_upstream_account(settings, account, make_primary=True)
         save_settings(settings)
 
         # 重新加载代理实例
@@ -735,6 +904,7 @@ async def oauth_callback(
             "success": True,
             "message": "登录成功！配置已自动更新",
             "api_key": api_key,
+            "account_id": saved_account.id,
         }
         
     except Exception as e:

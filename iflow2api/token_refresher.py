@@ -14,11 +14,13 @@ import threading
 from datetime import datetime
 from typing import Optional, Callable, Tuple
 
-logger = logging.getLogger("iflow2api")
-
+from .account_pool import build_iflow_config_from_account
 from .oauth import IFlowOAuth
-from .config import load_iflow_config, save_iflow_config, IFlowConfig
+from .config import IFlowConfig
+from .settings import AppSettings, UpstreamAccount, list_upstream_accounts, load_settings, save_settings, upsert_upstream_account
 from .transport import create_upstream_transport
+
+logger = logging.getLogger("iflow2api")
 
 
 # 刷新配置常量
@@ -111,21 +113,45 @@ class OAuthTokenRefresher:
         """运行刷新循环（在后台线程中）"""
         while not self._stop_event.is_set():
             try:
-                config = load_iflow_config()
-
-                if config.auth_type == "oauth-iflow":
-                    if self._should_refresh(config):
-                        logger.info("OAuth token 即将过期，开始刷新...")
-                        self._schedule_refresh(config)
-                elif config.auth_type == "cookie":
-                    if self._should_refresh_cookie(config):
-                        logger.info("Cookie 模式 API Key 即将过期，开始刷新...")
-                        self._schedule_cookie_refresh(config)
+                settings = load_settings()
+                for account in self._iter_refresh_candidates(settings):
+                    config = build_iflow_config_from_account(account)
+                    if config.auth_type == "oauth-iflow" and self._should_refresh(config):
+                        logger.info("OAuth token 即将过期，开始刷新: account_id=%s", account.id)
+                        self._schedule_refresh(account, config)
+                    elif config.auth_type == "cookie" and self._should_refresh_cookie(config):
+                        logger.info("Cookie 模式 API Key 即将过期，开始刷新: account_id=%s", account.id)
+                        self._schedule_cookie_refresh(account, config)
 
             except Exception as e:
                 logger.warning("检查 token 状态时出错: %s", e)
 
             self._stop_event.wait(self.check_interval)
+
+    @staticmethod
+    def _iter_refresh_candidates(settings: AppSettings) -> list[UpstreamAccount]:
+        """返回需要参与刷新检查的账号。"""
+        return [
+            account
+            for account in list_upstream_accounts(settings)
+            if (account.api_key or account.oauth_access_token or account.cookie)
+        ]
+
+    def _persist_account(self, account: UpstreamAccount) -> bool:
+        """将刷新后的账号写回配置。"""
+        settings = load_settings()
+
+        if settings.upstream_accounts:
+            existing_ids = {item.id for item in settings.upstream_accounts}
+            if account.id not in existing_ids and account.id != "legacy-primary":
+                logger.info("账号已从配置中移除，跳过刷新结果写回: %s", account.id)
+                return False
+
+        current_primary_id = settings.primary_account_id
+        make_primary = account.id == "legacy-primary" or not current_primary_id or current_primary_id == account.id
+        upsert_upstream_account(settings, account, make_primary=make_primary)
+        save_settings(settings)
+        return True
 
     def _should_refresh(self, config: IFlowConfig) -> bool:
         """
@@ -226,7 +252,7 @@ class OAuthTokenRefresher:
 
         return False
 
-    def _schedule_refresh(self, config: IFlowConfig) -> None:
+    def _schedule_refresh(self, account: UpstreamAccount, config: IFlowConfig) -> None:
         """
         安排 token 刷新任务（M-05 修复）
 
@@ -234,7 +260,7 @@ class OAuthTokenRefresher:
         避免在主进程中重复创建事件循环引发资源冲突。
         如果没有可用的主循环，则回退到 asyncio.run()。
         """
-        coro = self._refresh_token_with_retry(config)
+        coro = self._refresh_token_with_retry(account, config)
 
         if self._loop and self._loop.is_running():
             # 在主事件循环中运行，避免创建新循环
@@ -247,9 +273,9 @@ class OAuthTokenRefresher:
             # 回退：创建临时隔离事件循环（仅后台线程使用）
             asyncio.run(coro)
 
-    def _schedule_cookie_refresh(self, config: IFlowConfig) -> None:
+    def _schedule_cookie_refresh(self, account: UpstreamAccount, config: IFlowConfig) -> None:
         """安排 Cookie 模式刷新任务。"""
-        coro = self._refresh_cookie_with_retry(config)
+        coro = self._refresh_cookie_with_retry(account, config)
 
         if self._loop and self._loop.is_running():
             future = asyncio.run_coroutine_threadsafe(coro, self._loop)
@@ -260,7 +286,7 @@ class OAuthTokenRefresher:
         else:
             asyncio.run(coro)
 
-    async def _refresh_token_with_retry(self, config: IFlowConfig) -> bool:
+    async def _refresh_token_with_retry(self, account: UpstreamAccount, config: IFlowConfig) -> bool:
         """
         带重试机制的 token 刷新（支持指数退避）
 
@@ -281,36 +307,40 @@ class OAuthTokenRefresher:
 
         for attempt in range(1, self.retry_count + 1):
             try:
-                logger.info(
-                    "尝试刷新 token (第 %d/%d 次)...",
-                    attempt,
-                    self.retry_count
-                )
+                logger.info("尝试刷新 token (第 %d/%d 次): account_id=%s", attempt, self.retry_count, account.id)
 
                 token_data = await oauth.refresh_token(config.oauth_refresh_token)
 
-                # 更新配置
-                config.api_key = token_data.get("access_token", "")
-                config.oauth_access_token = token_data.get("access_token", "")
+                access_token = token_data.get("access_token", "")
+                config.api_key = access_token
+                config.oauth_access_token = access_token
                 if token_data.get("refresh_token"):
                     config.oauth_refresh_token = token_data["refresh_token"]
                 if token_data.get("expires_at"):
                     config.oauth_expires_at = token_data["expires_at"]
                     config.api_key_expires_at = token_data["expires_at"]
 
-                # 保存配置
-                save_iflow_config(config)
+                account.api_key = access_token
+                account.auth_type = "oauth-iflow"
+                account.oauth_access_token = access_token
+                if token_data.get("refresh_token"):
+                    account.oauth_refresh_token = token_data["refresh_token"]
+                if token_data.get("expires_at"):
+                    account.oauth_expires_at = token_data["expires_at"].isoformat()
+
+                self._persist_account(account)
 
                 # 重置失败计数
                 self._failure_count = 0
                 self._last_failure_time = None
 
-                logger.info("Token 刷新成功！")
+                logger.info("Token 刷新成功: account_id=%s", account.id)
 
                 # 调用回调
                 if self._on_refresh_callback:
                     token_data["auth_type"] = "oauth-iflow"
                     token_data["api_key"] = config.api_key
+                    token_data["account_id"] = account.id
                     self._on_refresh_callback(token_data)
 
                 return True
@@ -319,9 +349,10 @@ class OAuthTokenRefresher:
                 last_error = e
                 error_msg = str(e)
                 logger.warning(
-                    "Token 刷新失败 (第 %d/%d 次): %s",
+                    "Token 刷新失败 (第 %d/%d 次, account_id=%s): %s",
                     attempt,
                     self.retry_count,
+                    account.id,
                     error_msg
                 )
 
@@ -382,6 +413,7 @@ class OAuthTokenRefresher:
                 self._on_refresh_callback({
                     "error": True,
                     "transient": True,
+                    "account_id": account.id,
                     "message": f"服务器暂时不可用，将自动重试: {last_error}",
                     "attempts": self.retry_count
                 })
@@ -395,13 +427,14 @@ class OAuthTokenRefresher:
                 self._on_refresh_callback({
                     "error": True,
                     "transient": False,
+                    "account_id": account.id,
                     "message": f"Token 刷新失败，请重新登录: {last_error}",
                     "attempts": self.retry_count
                 })
 
         return False
 
-    async def _refresh_cookie_with_retry(self, config: IFlowConfig) -> bool:
+    async def _refresh_cookie_with_retry(self, account: UpstreamAccount, config: IFlowConfig) -> bool:
         """
         带重试机制的 Cookie 模式 API Key 刷新。
 
@@ -417,11 +450,7 @@ class OAuthTokenRefresher:
 
         for attempt in range(1, self.retry_count + 1):
             try:
-                logger.info(
-                    "尝试刷新 Cookie 模式 API Key (第 %d/%d 次)...",
-                    attempt,
-                    self.retry_count,
-                )
+                logger.info("尝试刷新 Cookie 模式 API Key (第 %d/%d 次): account_id=%s", attempt, self.retry_count, account.id)
 
                 key_data = await oauth.refresh_api_key_with_cookie(
                     config.cookie,
@@ -440,14 +469,23 @@ class OAuthTokenRefresher:
                     config.cookie_email = resolved_email
                 config.api_key_expires_at = self._parse_cookie_expire_time(expired)
 
-                save_iflow_config(config)
+                account.api_key = api_key
+                account.auth_type = "cookie"
+                account.cookie = config.cookie or account.cookie
+                account.cookie_email = resolved_email or account.cookie_email
+                account.cookie_expires_at = expired or None
+                if resolved_email and not account.email:
+                    account.email = resolved_email
+
+                self._persist_account(account)
 
                 self._failure_count = 0
                 self._last_failure_time = None
-                logger.info("Cookie 模式 API Key 刷新成功！")
+                logger.info("Cookie 模式 API Key 刷新成功: account_id=%s", account.id)
 
                 if self._on_refresh_callback:
                     self._on_refresh_callback({
+                        "account_id": account.id,
                         "auth_type": "cookie",
                         "api_key": api_key,
                         "cookie": config.cookie,
@@ -461,9 +499,10 @@ class OAuthTokenRefresher:
                 last_error = e
                 error_msg = str(e)
                 logger.warning(
-                    "Cookie 模式刷新失败 (第 %d/%d 次): %s",
+                    "Cookie 模式刷新失败 (第 %d/%d 次, account_id=%s): %s",
                     attempt,
                     self.retry_count,
+                    account.id,
                     error_msg,
                 )
 
@@ -515,6 +554,7 @@ class OAuthTokenRefresher:
                     "error": True,
                     "transient": True,
                     "auth_type": "cookie",
+                    "account_id": account.id,
                     "message": f"服务器暂时不可用，将自动重试: {last_error}",
                     "attempts": self.retry_count,
                 })
@@ -528,6 +568,7 @@ class OAuthTokenRefresher:
                     "error": True,
                     "transient": False,
                     "auth_type": "cookie",
+                    "account_id": account.id,
                     "message": f"Cookie 模式刷新失败，请重新登录: {last_error}",
                     "attempts": self.retry_count,
                 })
@@ -541,7 +582,18 @@ class OAuthTokenRefresher:
         Args:
             config: 当前 iFlow 配置
         """
-        await self._refresh_token_with_retry(config)
+        account = UpstreamAccount(
+            auth_type=(config.auth_type or "oauth-iflow"),
+            api_key=config.api_key,
+            base_url=config.base_url,
+            oauth_access_token=config.oauth_access_token or "",
+            oauth_refresh_token=config.oauth_refresh_token or "",
+            oauth_expires_at=config.oauth_expires_at.isoformat() if config.oauth_expires_at else None,
+            cookie=config.cookie or "",
+            cookie_email=config.cookie_email or "",
+            cookie_expires_at=config.cookie_expires_at,
+        )
+        await self._refresh_token_with_retry(account, config)
 
     def is_running(self) -> bool:
         """
@@ -560,11 +612,13 @@ class OAuthTokenRefresher:
             True 表示需要立即刷新
         """
         try:
-            config = load_iflow_config()
-            if config.auth_type == "oauth-iflow":
-                return self._should_refresh(config)
-            if config.auth_type == "cookie":
-                return self._should_refresh_cookie(config)
+            settings = load_settings()
+            for account in self._iter_refresh_candidates(settings):
+                config = build_iflow_config_from_account(account)
+                if config.auth_type == "oauth-iflow" and self._should_refresh(config):
+                    return True
+                if config.auth_type == "cookie" and self._should_refresh_cookie(config):
+                    return True
             return False
         except Exception:
             return False
@@ -577,7 +631,21 @@ class OAuthTokenRefresher:
             包含刷新器状态的字典
         """
         try:
-            config = load_iflow_config()
+            settings = load_settings()
+            account = next(iter(self._iter_refresh_candidates(settings)), None)
+            if account is None:
+                return {
+                    "running": self._running,
+                    "check_interval_hours": self.check_interval / 3600,
+                    "refresh_buffer_hours": self.refresh_buffer / 3600,
+                    "auth_type": None,
+                    "expires_at": None,
+                    "time_until_expiry_seconds": None,
+                    "should_refresh_now": False,
+                    "failure_count": self._failure_count,
+                    "last_failure_time": self._last_failure_time.isoformat() if self._last_failure_time else None,
+                }
+            config = build_iflow_config_from_account(account)
             expires_at = config.api_key_expires_at or config.oauth_expires_at
             if config.auth_type == "cookie" and config.cookie_expires_at:
                 parsed_cookie_expire = self._parse_cookie_expire_time(config.cookie_expires_at)
@@ -592,6 +660,7 @@ class OAuthTokenRefresher:
                 "running": self._running,
                 "check_interval_hours": self.check_interval / 3600,
                 "refresh_buffer_hours": self.refresh_buffer / 3600,
+                "account_id": account.id,
                 "auth_type": config.auth_type,
                 "has_refresh_token": bool(config.oauth_refresh_token),
                 "has_cookie": bool(config.cookie),
