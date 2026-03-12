@@ -69,6 +69,12 @@ class OAuthCallbackRequest(BaseModel):
     state: Optional[str] = None
 
 
+class CookieLoginRequest(BaseModel):
+    """Cookie 登录请求"""
+    cookie: str
+    email: str
+
+
 # 认证依赖
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
@@ -514,6 +520,59 @@ async def oauth_callback_get(code: str, state: Optional[str] = None):
     </html>
     """
     return HTMLResponse(content=html_content)
+
+
+@admin_router.post("/cookie/login")
+async def cookie_login(
+    request: CookieLoginRequest,
+    username: str = Depends(get_current_user),
+) -> dict[str, Any]:
+    """使用 BXAuth Cookie 登录"""
+    from ..oauth import IFlowOAuth
+    from ..settings import load_settings, save_settings
+
+    oauth = IFlowOAuth()
+
+    try:
+        # 使用 cookie 刷新 API Key
+        key_data = await oauth.refresh_api_key_with_cookie(
+            request.cookie,
+            request.email
+        )
+
+        api_key = key_data.get("apiKey", "")
+        expired = key_data.get("expired", "")
+
+        if not api_key:
+            return {
+                "success": False,
+                "message": "获取 API Key 失败"
+            }
+
+        # 保存到配置
+        settings = load_settings()
+        settings.api_key = api_key
+        settings.auth_type = "cookie"
+        save_settings(settings)
+
+        return {
+            "success": True,
+            "message": "Cookie 登录成功",
+            "data": {
+                "expired": expired,
+            }
+        }
+
+    except ValueError as e:
+        return {
+            "success": False,
+            "message": str(e)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Cookie 登录失败: {str(e)}"
+        }
 
 
 @admin_router.post("/oauth/callback")

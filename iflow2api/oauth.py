@@ -18,6 +18,9 @@ class IFlowOAuth:
     USER_INFO_URL = "https://iflow.cn/api/oauth/getUserInfo"
     AUTH_URL = "https://iflow.cn/oauth"
 
+    # Cookie 认证配置
+    API_KEY_ENDPOINT = "https://platform.iflow.cn/api/openapi/apikey"
+
     def __init__(self):
         self._client: Optional[BaseUpstreamTransport] = None
 
@@ -224,6 +227,66 @@ class IFlowOAuth:
             return True
         except Exception:
             return False
+
+    async def refresh_api_key_with_cookie(self, cookie: str, email: str) -> Dict[str, Any]:
+        """
+        使用 BXAuth cookie 刷新 API Key
+
+        Args:
+            cookie: BXAuth cookie 字符串（必须包含 BXAuth=xxx）
+            email: 用户邮箱
+
+        Returns:
+            包含 apiKey 和 expired 的字典
+        """
+        if not cookie or not cookie.strip():
+            raise ValueError("Cookie 不能为空")
+
+        if "BXAuth=" not in cookie:
+            raise ValueError("Cookie 必须包含 BXAuth 字段")
+
+        if not email or not email.strip():
+            raise ValueError("邮箱不能为空")
+
+        client = await self._get_client()
+
+        # 请求体
+        request_body = {"name": email.strip()}
+
+        # 伪装成浏览器请求
+        headers = {
+            "Cookie": cookie.strip(),
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*","User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36","Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Origin": "https://platform.iflow.cn",
+            "Referer": "https://platform.iflow.cn/",}
+
+        response = await client.post(
+            self.API_KEY_ENDPOINT,
+            json_body=request_body,
+            headers=headers,
+            timeout=30.0,
+        )
+
+        if response.status_code == 401:
+            raise ValueError("Cookie 无效或已过期")
+
+        response.raise_for_status()
+
+        result = response.json()
+
+        # 检查响应格式
+        if result.get("success") and result.get("data"):
+            data = result["data"]
+            return {
+                "apiKey": data.get("apiKey", ""),
+                "expired": data.get("expired", ""),
+            }
+        else:
+            error_msg = result.get("message", "未知错误")
+            raise ValueError(f"刷新 API Key 失败: {error_msg}")
 
     def is_token_expired(
         self, expires_at: Optional[datetime], buffer_seconds: int = 300
