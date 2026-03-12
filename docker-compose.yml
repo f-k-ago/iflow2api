@@ -22,10 +22,8 @@ services:
       - HOST=0.0.0.0
       - PORT=28000
     volumes:
-      # 配置目录（通过 Web UI 管理，支持 OAuth 自动刷新）
-      - iflow2api-config:/home/appuser/.iflow
-      # 如果已有本地配置，可以挂载（二选一）：
-      # - ~/.iflow:/home/appuser/.iflow:ro
+      # iflow2api 应用配置（WebUI 设置、账号池、管理员用户、日志、密钥）
+      - ./data/iflow2api:/home/appuser/.iflow2api
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:28000/health"]
       interval: 30s
@@ -37,7 +35,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  iflow2api-config:
-    driver: local
