@@ -188,7 +188,7 @@
                                 </div>
                                 <div class="form-row">
                                     <button type="button" id="import-cli-btn" class="btn btn-secondary">从 iFlow CLI 导入</button>
-                                    <button type="button" id="oauth-login-btn" class="btn btn-primary">Login with iFlow</button>
+                                    <button type="button" id="oauth-login-btn" class="btn btn-primary">OAuth 登录</button>                    <button type="button" id="cookie-login-btn" class="btn btn-secondary">Cookie 登录</button>
                                 </div>
                             </form>
                         </div>
@@ -438,6 +438,73 @@
     <!-- Toast 通知 -->
     <div id="toast-container"></div>
 
-    <script src="/admin/static/js/app.js"></script>
+    <script src="/admin/static/js/app.js">// Cookie 登录处理
+        const cookieSubmitBtn = document.getElementById('cookie-submit-btn');
+        const cookieInput = document.getElementById('cookie-input');
+        const cookieEmail = document.getElementById('cookie-email');
+        const cookieStatus = document.getElementById('cookie-status');
+
+        if (cookieSubmitBtn) {
+            cookieSubmitBtn.addEventListener('click', async () => {
+                const cookie = cookieInput.value.trim();
+                const email = cookieEmail.value.trim();
+
+                if (!cookie) {
+                    cookieStatus.textContent = '请输入 Cookie';
+                    cookieStatus.style.color = 'red';
+                    return;
+                }
+
+                if (!email) {
+                    cookieStatus.textContent = '请输入邮箱地址';
+                    cookieStatus.style.color = 'red';
+                    return;
+                }
+
+                if (!cookie.includes('BXAuth=')) {
+                    cookieStatus.textContent = 'Cookie 必须包含 BXAuth 字段';
+                    cookieStatus.style.color = 'red';
+                    return;
+                }
+
+                cookieStatus.textContent = '正在登录...';
+                cookieStatus.style.color = 'blue';
+                cookieSubmitBtn.disabled = true;
+
+                try {
+                    const response = await fetch('/admin/cookie/login', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json','Authorization': `Bearer ${localStorage.getItem('token')}`
+                        },
+                        body: JSON.stringify({ cookie, email })
+                    });
+
+                    const result = await response.json();
+
+                    if (result.success) {
+                        cookieStatus.textContent = 'Cookie 登录成功！正在刷新配置...';
+                        cookieStatus.style.color = 'green';
+
+                        // 清空输入
+                        cookieInput.value = '';
+                        cookieEmail.value = '';
+
+                        // 刷新设置
+                        setTimeout(() => {
+                            loadSettings();
+                            cookieStatus.textContent = '';}, 2000);
+                    } else {
+                        cookieStatus.textContent = `登录失败: ${result.message}`;
+                        cookieStatus.style.color = 'red';
+                    }
+                } catch (error) {
+                    cookieStatus.textContent = `登录失败: ${error.message}`;
+                    cookieStatus.style.color = 'red';
+                } finally {
+                    cookieSubmitBtn.disabled = false;
+                }
+            });
+        }</script>
 </body>
 </html>
