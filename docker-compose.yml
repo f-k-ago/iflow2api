@@ -1,14 +1,17 @@
 # iFlow2API Docker Compose 配置
 # 用于快速部署 iFlow2API 服务
+#
+# 使用私有 GHCR 镜像前需要先登录：
+# echo "YOUR_GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+#
+# Token 权限要求：read:packages
+# 创建 Token: https://github.com/settings/tokens
 
 version: '3.8'
 
 services:
   iflow2api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: iflow2api:latest
+    image: ghcr.io/f-k-ago/iflow2api:edge
     container_name: iflow2api
     restart: unless-stopped
     ports:
