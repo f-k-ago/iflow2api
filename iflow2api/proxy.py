@@ -11,7 +11,7 @@ import secrets
 import platform
 import urllib.parse
 
-from typing import AsyncIterator, Literal, Optional, overload
+from typing import Any, AsyncIterator, Literal, Optional, overload
 from .config import IFlowConfig
 from .transport import BaseUpstreamTransport, create_upstream_transport
 
@@ -26,6 +26,59 @@ MMSTAT_GM_BASE = "https://gm.mmstat.com"
 MMSTAT_VGIF_URL = "https://log.mmstat.com/v.gif"
 IFLOW_USERINFO_URL = "https://iflow.cn/api/oauth/getUserInfo"
 NODE_VERSION_EMULATED = "v22.22.0"
+
+
+class UpstreamAPIError(Exception):
+    """上游 API 返回的业务错误。"""
+
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        error_type: str = "api_error",
+        payload: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_type = error_type
+        self.payload = payload
+
+
+def parse_upstream_business_error(payload: Any) -> UpstreamAPIError | None:
+    """识别 iflow 上游在 HTTP 200 中返回的业务错误包。"""
+    if not isinstance(payload, dict):
+        return None
+
+    error = payload.get("error")
+    error_message = ""
+    if isinstance(error, dict):
+        error_message = str(error.get("message") or "").strip()
+
+    message = str(payload.get("msg") or payload.get("message") or error_message or "").strip()
+    status_token = payload.get("status")
+    if status_token in (None, ""):
+        status_token = payload.get("error_code")
+    status_text = str(status_token).strip() if status_token not in (None, "") else ""
+
+    message_lower = message.lower()
+    if (
+        status_text == "434"
+        or "invalid apikey" in message_lower
+        or "blocked due to unauthorized requests" in message_lower
+    ):
+        return UpstreamAPIError(401, message or "Invalid API key", error_type="authentication_error", payload=payload)
+    if status_text == "439":
+        return UpstreamAPIError(401, message or "API token expired", error_type="authentication_error", payload=payload)
+    if status_text == "435":
+        return UpstreamAPIError(400, message or "Model not support", error_type="invalid_request_error", payload=payload)
+    if status_text in {"429", "449", "8211"}:
+        return UpstreamAPIError(429, message or "Rate limit reached", error_type="rate_limit_exceeded", payload=payload)
+    if status_text in {"511", "413"}:
+        return UpstreamAPIError(413, message or "Content length exceeded", error_type="invalid_request_error", payload=payload)
+    if status_text == "514":
+        return UpstreamAPIError(502, message or "Model error", error_type="api_error", payload=payload)
+    return None
 
 
 def generate_signature(user_agent: str, session_id: str, timestamp: int, api_key: str) -> str | None:
@@ -60,9 +113,9 @@ class IFlowProxy:
         self.base_url = config.base_url.rstrip("/")
         self._client: Optional[BaseUpstreamTransport] = None
         # 保持会话一致性
-        # 与 iflow-cli 的观测结果保持一致：session-id 使用 session- 前缀
-        self._session_id = f"session-{uuid.uuid4()}"
-        self._conversation_id = str(uuid.uuid4())
+        # 优先复用账号持久化的 session / conversation id，降低漂移
+        self._session_id = (config.session_id or "").strip() or f"session-{uuid.uuid4()}"
+        self._conversation_id = (config.conversation_id or "").strip() or str(uuid.uuid4())
         self._telemetry_user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, config.api_key or self._session_id))
 
     @staticmethod
@@ -107,10 +160,6 @@ class IFlowProxy:
             "user-agent": IFLOW_CLI_USER_AGENT,
             "session-id": self._session_id,
             "conversation-id": self._conversation_id,
-            "accept": "*/*",
-            "accept-language": "*",
-            "sec-fetch-mode": "cors",
-            "accept-encoding": "br, gzip, deflate",
         }
 
         # HMAC 签名：`${userAgent}:${sessionId}:${timestamp}`
@@ -126,7 +175,8 @@ class IFlowProxy:
 
         # iflow-cli 中 traceparent 为“有则传”的可选头。
         # 同一轮请求链路中需复用同一个 traceparent（chat + telemetry）。
-        headers["traceparent"] = traceparent or self._generate_traceparent()
+        if traceparent:
+            headers["traceparent"] = traceparent
 
         # Aone 分支专有头。
         if self._is_aone_endpoint():
@@ -368,25 +418,26 @@ class IFlowProxy:
         对齐 iflow-cli 的通用请求体默认参数。
 
         观测到官方 CLI 在 chat/completions 会补齐：
+        - stream=true 时额外携带 stream_options.include_usage=true
         - max_new_tokens
-        - temperature
-        - top_p
-        - tools（即使为空数组）
+        - 不会显式补 temperature/top_p/tools=[]
 
         并且不会把 transport 层的 stream 字段透传给上游 body。
         """
         body = request_body.copy()
 
-        # 官方行为：流式请求会携带 stream=true；非流式不携带该字段
+        # 官方行为：流式请求会携带 stream=true 和 stream_options.include_usage=true；
+        # 非流式不携带这两个字段。
         body.pop("stream", None)
         if stream:
             body["stream"] = True
+            body["stream_options"] = {"include_usage": True}
+        else:
+            body.pop("stream_options", None)
 
-        # 官方默认参数（来源于官方 CLI 抓包 + bundle 配置）
-        body.setdefault("temperature", 0.7)
-        body.setdefault("top_p", 0.95)
-        body.setdefault("max_new_tokens", 8192)
-        body.setdefault("tools", [])
+        if "max_new_tokens" not in body:
+            max_tokens = body.get("max_tokens")
+            body["max_new_tokens"] = max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else 8192
 
         return body
 
@@ -439,6 +490,8 @@ class IFlowProxy:
                 body["enable_thinking"] = True
             if "thinking" not in body:
                 body["thinking"] = {"type": "enabled"}
+            body["temperature"] = 1
+            body["top_p"] = 0.95
             logger.debug("为模型 %s 添加思考参数: chat_template_kwargs, enable_thinking, thinking", model)
         
         # 3. GLM-4.7 模型
@@ -446,6 +499,8 @@ class IFlowProxy:
         elif model == "glm-4.7":
             if "chat_template_kwargs" not in body:
                 body["chat_template_kwargs"] = {"enable_thinking": True}
+            body["temperature"] = 1
+            body["top_p"] = 0.95
             logger.debug("为模型 %s 添加思考参数: chat_template_kwargs", model)
         
         # 4. 其他 GLM 模型
@@ -714,7 +769,12 @@ class IFlowProxy:
                             logger.debug("上游非流式响应体: %s", body_str[:500])
                             try:
                                 error_data = json.loads(body_str)
-                                error_msg = error_data.get("msg") or error_data.get("error", {}).get("message") or body_str[:200]
+                                upstream_error = parse_upstream_business_error(error_data)
+                                error_msg = (
+                                    str(upstream_error)
+                                    if upstream_error is not None
+                                    else error_data.get("msg") or error_data.get("error", {}).get("message") or body_str[:200]
+                                )
                             except json.JSONDecodeError:
                                 error_msg = body_str[:200] or "上游返回空响应"
 
@@ -808,6 +868,9 @@ class IFlowProxy:
                 )
                 response.raise_for_status()
                 result = response.json()
+                upstream_error = parse_upstream_business_error(result)
+                if upstream_error is not None:
+                    raise upstream_error
 
                 # 确保 usage 统计信息存在 (OpenAI 兼容)
                 if "usage" not in result:

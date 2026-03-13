@@ -34,6 +34,8 @@ class UpstreamAccount(BaseModel):
     cookie_expires_at: Optional[str] = None
     email: str = ""
     phone: str = ""
+    session_id: str = ""
+    conversation_id: str = ""
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -57,9 +59,16 @@ def _normalize_account(account: UpstreamAccount) -> UpstreamAccount:
     account.cookie_email = (account.cookie_email or "").strip()
     account.email = (account.email or "").strip()
     account.phone = (account.phone or "").strip()
+    account.session_id = (account.session_id or "").strip()
+    account.conversation_id = (account.conversation_id or "").strip()
 
     if account.auth_type == "cookie" and not account.email and account.cookie_email:
         account.email = account.cookie_email
+
+    if not account.session_id:
+        account.session_id = f"session-{uuid4()}"
+    if not account.conversation_id:
+        account.conversation_id = str(uuid4())
 
     if not account.created_at:
         account.created_at = _now_iso()
@@ -150,7 +159,7 @@ class AppSettings(BaseModel):
     # 上游传输层配置（用于 TLS 指纹对齐）
     # - httpx: 使用 Python/OpenSSL 默认 TLS 栈
     # - curl_cffi: 使用 curl-impersonate，可伪装为 Chrome/Node 风格握手
-    upstream_transport_backend: str = "curl_cffi"
+    upstream_transport_backend: str = "httpx"
     tls_impersonate: str = "chrome124"
 
     # 多账号池配置
@@ -289,6 +298,8 @@ def upsert_upstream_account(
         existing = _normalize_account(settings.upstream_accounts[match_index])
         created_at = existing.created_at
         merged = existing.model_copy(update=normalized.model_dump())
+        merged.session_id = existing.session_id or normalized.session_id
+        merged.conversation_id = existing.conversation_id or normalized.conversation_id
         merged.created_at = created_at or normalized.created_at or now
         merged.updated_at = now
         settings.upstream_accounts[match_index] = _normalize_account(merged)
@@ -450,6 +461,14 @@ def load_settings() -> AppSettings:
                     settings.tls_impersonate = data["tls_impersonate"]
         except Exception as _e:
             logger.warning("读取应用配置文件失败: %s", _e)
+
+    if (
+        settings.upstream_transport_backend == "curl_cffi"
+        and settings.tls_impersonate == "chrome124"
+        and (settings.base_url or DEFAULT_BASE_URL).rstrip("/") == DEFAULT_BASE_URL
+    ):
+        logger.info("检测到 legacy curl_cffi/chrome124 配置，已自动切换为 httpx 以对齐官方 iFlow CLI")
+        settings.upstream_transport_backend = "httpx"
 
     if settings.upstream_accounts:
         sync_legacy_auth_fields(settings)

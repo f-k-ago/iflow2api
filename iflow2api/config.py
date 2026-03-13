@@ -40,6 +40,8 @@ class IFlowConfig(BaseModel):
         default=None,
         description="Cookie 模式下 apiKey 过期时间（原始字符串）",
     )
+    session_id: Optional[str] = Field(default=None, description="上游会话 ID")
+    conversation_id: Optional[str] = Field(default=None, description="上游对话 ID")
 
 
 def get_app_config_path() -> Path:
@@ -130,6 +132,8 @@ def _build_config_from_mapping(raw: dict[str, Any]) -> IFlowConfig:
         cookie=_decrypt_token(raw.get("cookie")) or None,
         cookie_email=(raw.get("cookie_email") or None),
         cookie_expires_at=(raw.get("cookie_expires_at") or None),
+        session_id=(raw.get("session_id") or None),
+        conversation_id=(raw.get("conversation_id") or None),
     )
 
 

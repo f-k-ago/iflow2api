@@ -37,6 +37,8 @@ def build_iflow_config_from_account(account: UpstreamAccount) -> IFlowConfig:
         cookie=(account.cookie or None),
         cookie_email=(account.cookie_email or account.email or None),
         cookie_expires_at=account.cookie_expires_at,
+        session_id=(account.session_id or None),
+        conversation_id=(account.conversation_id or None),
     )
 
 

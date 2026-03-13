@@ -553,10 +553,17 @@ def update_proxy_token(token_data: dict):
     reload_proxy()
 
 
-def _extract_upstream_error(exc: Exception) -> tuple[int, str]:
+def _extract_upstream_error(exc: Exception) -> tuple[int, str, str]:
     """提取上游异常中的状态码和错误消息。"""
     error_msg = str(exc)
     status_code = 500
+    error_type = "api_error"
+
+    custom_status_code = getattr(exc, "status_code", None)
+    if custom_status_code is not None:
+        status_code = custom_status_code
+        error_type = getattr(exc, "error_type", error_type)
+
     response = getattr(exc, "response", None)
     if response is not None:
         try:
@@ -565,7 +572,7 @@ def _extract_upstream_error(exc: Exception) -> tuple[int, str]:
             error_msg = error_data.get("msg", error_msg)
         except Exception:
             pass
-    return _normalize_error_status_code(status_code), error_msg
+    return _normalize_error_status_code(status_code), error_msg, error_type
 
 
 def _normalize_error_status_code(status_code: object) -> int:
@@ -584,8 +591,8 @@ def _normalize_error_status_code(status_code: object) -> int:
 
 def _map_upstream_exception(exc: Exception) -> JSONResponse:
     """将上游异常映射为兼容响应。"""
-    status_code, error_msg = _extract_upstream_error(exc)
-    return create_error_response(status_code, error_msg)
+    status_code, error_msg, error_type = _extract_upstream_error(exc)
+    return create_error_response(status_code, error_msg, error_type)
 
 
 async def _acquire_upstream_lease():
@@ -1442,10 +1449,10 @@ async def messages_anthropic(request: Request):
                 )
             except Exception as e:
                 await lease.close()
-                status_code, error_msg = _extract_upstream_error(e)
+                status_code, error_msg, error_type = _extract_upstream_error(e)
                 return JSONResponse(
                     status_code=status_code,
-                    content={"type": "error", "error": {"type": "api_error", "message": error_msg}},
+                    content={"type": "error", "error": {"type": error_type, "message": error_msg}},
                 )
 
             async def generate_anthropic_stream_with_lease():
@@ -1692,6 +1699,8 @@ async def root_post(request: Request):
             try:
                 logger.debug("获取上游非流式响应 (root_post): account_id=%s", lease.account.id)
                 result = await _run_nonstream_with_lease(lease, body)
+            except Exception as e:
+                return _map_upstream_exception(e)
             finally:
                 await lease.close()
             # 验证响应包含有效的 choices
