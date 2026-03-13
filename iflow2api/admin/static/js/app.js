@@ -134,9 +134,11 @@ function renderUpstreamAccounts(accounts, tableId, includeActions = false) {
                     <div class="table-primary-text">${escapeHtml(statusText)}</div>
                 </td>
                 <td class="account-actions-cell">
-                    <button type="button" class="btn btn-secondary btn-sm" onclick="testUpstreamAccount('${account.id}')" ${!account.enabled ? 'disabled' : ''}>测试</button>
-                    <button type="button" class="btn btn-secondary btn-sm" onclick="toggleUpstreamAccount('${account.id}', ${!account.enabled})">${account.enabled ? '停用' : '启用'}</button>
-                    <button type="button" class="btn btn-danger btn-sm" onclick="deleteUpstreamAccount('${account.id}')">删除</button>
+                    <div class="account-actions-group">
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="testUpstreamAccount('${account.id}')" ${!account.enabled ? 'disabled' : ''}>测试</button>
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="toggleUpstreamAccount('${account.id}', ${!account.enabled})">${account.enabled ? '停用' : '启用'}</button>
+                        <button type="button" class="btn btn-danger btn-sm" onclick="deleteUpstreamAccount('${account.id}')">删除</button>
+                    </div>
                 </td>
             `;
         } else {
