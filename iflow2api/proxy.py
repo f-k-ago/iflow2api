@@ -144,9 +144,16 @@ class IFlowProxy:
         self._telemetry_user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, config.api_key or self._session_id))
 
     @staticmethod
-    def _generate_trace_id() -> str:
-        """生成与 telemetry 对齐的 trace_id。"""
-        return secrets.token_hex(16)
+    def _build_trace_context(traceparent: Optional[str], conversation_id: str) -> dict[str, str]:
+        """构造与官方 currentSession 更接近的 trace 上下文。"""
+        normalized = (traceparent or "").strip()
+        trace_id = IFlowProxy._extract_trace_id(normalized) if normalized else ""
+        sam = f"iflow.cli.{conversation_id}.{trace_id}" if trace_id else ""
+        return {
+            "traceparent": normalized,
+            "trace_id": trace_id,
+            "sam": sam,
+        }
 
     def _is_aone_endpoint(self) -> bool:
         """是否为 Aone 端点（iflow-cli 在此分支追加额外头）。"""
@@ -269,7 +276,7 @@ class IFlowProxy:
     def _rand_observation_id() -> str:
         return secrets.token_hex(8)
 
-    async def _telemetry_post_gm(self, path: str, gokey: str) -> None:
+    async def _telemetry_post_gm(self, path: str, gokey: dict[str, Any]) -> None:
         """发送 gm.mmstat 事件（run_started / run_error）。"""
         try:
             client = await self._get_client()
@@ -326,45 +333,51 @@ class IFlowProxy:
         except Exception as e:
             logger.debug("mmstat v.gif failed: %s", e)
 
-    async def _emit_run_started(self, model: str, trace_id: str) -> str:
+    async def _emit_run_started(self, model: str, trace_context: dict[str, str]) -> str:
         observation_id = self._rand_observation_id()
-        gokey = (
-            f"pid=iflow"
-            f"&sam=iflow.cli.{self._conversation_id}.{trace_id}"
-            f"&trace_id={trace_id}"
-            f"&session_id={self._session_id}"
-            f"&conversation_id={self._conversation_id}"
-            f"&observation_id={observation_id}"
-            f"&model={urllib.parse.quote(model or '')}"
-            f"&tool="
-            f"&user_id={self._telemetry_user_id}"
-        )
+        gokey = {
+            "pid": "iflow",
+            "sam": trace_context["sam"],
+            "trace_id": trace_context["trace_id"],
+            "session_id": self._session_id,
+            "conversation_id": self._conversation_id,
+            "observation_id": observation_id,
+            "model": model or "",
+            "tool": "",
+            "user_id": self._telemetry_user_id,
+        }
         await self._telemetry_post_gm("//aitrack.lifecycle.run_started", gokey)
         await self._telemetry_post_vgif()
         return observation_id
 
-    async def _emit_run_error(self, model: str, trace_id: str, parent_observation_id: str, error_msg: str) -> None:
+    async def _emit_run_error(
+        self,
+        model: str,
+        trace_context: dict[str, str],
+        parent_observation_id: str,
+        error_msg: str,
+    ) -> None:
         observation_id = self._rand_observation_id()
-        gokey = (
-            f"pid=iflow"
-            f"&sam=iflow.cli.{self._conversation_id}.{trace_id}"
-            f"&trace_id={trace_id}"
-            f"&observation_id={observation_id}"
-            f"&parent_observation_id={parent_observation_id}"
-            f"&session_id={self._session_id}"
-            f"&conversation_id={self._conversation_id}"
-            f"&user_id={self._telemetry_user_id}"
-            f"&error_msg={urllib.parse.quote(error_msg)}"
-            f"&model={urllib.parse.quote(model or '')}"
-            f"&tool="
-            f"&toolName="
-            f"&toolArgs="
-            f"&cliVer={IFLOW_CLI_VERSION}"
-            f"&platform={urllib.parse.quote(platform.system().lower())}"
-            f"&arch={urllib.parse.quote(platform.machine().lower())}"
-            f"&nodeVersion={urllib.parse.quote(NODE_VERSION_EMULATED)}"
-            f"&osVersion={urllib.parse.quote(platform.platform())}"
-        )
+        gokey = {
+            "pid": "iflow",
+            "sam": trace_context["sam"],
+            "trace_id": trace_context["trace_id"],
+            "observation_id": observation_id,
+            "parent_observation_id": parent_observation_id,
+            "session_id": self._session_id,
+            "conversation_id": self._conversation_id,
+            "user_id": self._telemetry_user_id,
+            "error_msg": error_msg,
+            "model": model or "",
+            "tool": "",
+            "toolName": "",
+            "toolArgs": None,
+            "cliVer": IFLOW_CLI_VERSION,
+            "platform": platform.system().lower(),
+            "arch": platform.machine().lower(),
+            "nodeVersion": NODE_VERSION_EMULATED,
+            "osVersion": platform.platform(),
+        }
         await self._telemetry_post_gm("//aitrack.lifecycle.run_error", gokey)
 
     async def _get_client(self) -> BaseUpstreamTransport:
@@ -805,12 +818,13 @@ class IFlowProxy:
             )
         request_body = self._configure_model_request(request_body, model)
 
-        # 统一 trace 链路：同一轮 run_started/chat/run_error 复用同一个 trace_id
+        # 统一 trace 链路：同一轮 run_started/chat/run_error 复用同一份 trace 上下文。
+        # 当前 iflow2api 没有完整接入官方的 OTel span 树，因此默认不凭空伪造 traceparent。
         traceparent = None
-        trace_id = self._generate_trace_id()
+        trace_context = self._build_trace_context(traceparent, self._conversation_id)
         parent_observation_id = ""
         try:
-            parent_observation_id = await self._emit_run_started(model, trace_id)
+            parent_observation_id = await self._emit_run_started(model, trace_context)
         except Exception as e:
             logger.debug("emit run_started failed: %s", e)
 
@@ -864,7 +878,7 @@ class IFlowProxy:
 
                             if parent_observation_id:
                                 try:
-                                    await self._emit_run_error(model, trace_id, parent_observation_id, error_msg)
+                                    await self._emit_run_error(model, trace_context, parent_observation_id, error_msg)
                                 except Exception as telemetry_err:
                                     logger.debug("emit run_error failed: %s", telemetry_err)
 
@@ -931,7 +945,7 @@ class IFlowProxy:
                     logger.error("流式请求错误: %s", e)
                     if parent_observation_id:
                         try:
-                            await self._emit_run_error(model, trace_id, parent_observation_id, str(e))
+                            await self._emit_run_error(model, trace_context, parent_observation_id, str(e))
                         except Exception as telemetry_err:
                             logger.debug("emit run_error failed: %s", telemetry_err)
                     raise
@@ -973,7 +987,7 @@ class IFlowProxy:
             except Exception as e:
                 if parent_observation_id:
                     try:
-                        await self._emit_run_error(model, trace_id, parent_observation_id, str(e))
+                        await self._emit_run_error(model, trace_context, parent_observation_id, str(e))
                     except Exception as telemetry_err:
                         logger.debug("emit run_error failed: %s", telemetry_err)
                 raise
