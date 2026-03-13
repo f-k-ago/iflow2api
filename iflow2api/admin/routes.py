@@ -56,7 +56,6 @@ class SettingsUpdate(BaseModel):
     # 上游代理设置
     upstream_proxy: Optional[str] = None
     upstream_proxy_enabled: Optional[bool] = None
-    upstream_compat_mode: Optional[str] = None
 
 
 class OAuthCallbackRequest(BaseModel):
@@ -415,7 +414,6 @@ async def get_settings(username: str = Depends(get_current_user)) -> dict[str, A
         # 上游代理设置
         "upstream_proxy": settings.upstream_proxy,
         "upstream_proxy_enabled": settings.upstream_proxy_enabled,
-        "upstream_compat_mode": settings.upstream_compat_mode,
         # 不返回 OAuth 敏感信息
     }
 
@@ -454,8 +452,6 @@ async def update_settings(
         settings.upstream_proxy = request.upstream_proxy
     if request.upstream_proxy_enabled is not None:
         settings.upstream_proxy_enabled = request.upstream_proxy_enabled
-    if request.upstream_compat_mode is not None:
-        settings.upstream_compat_mode = request.upstream_compat_mode
 
     save_settings(settings)
     

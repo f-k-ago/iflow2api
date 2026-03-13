@@ -1215,7 +1215,12 @@ async def chat_completions_openai(request: Request):
                 finally:
                     logger.debug("流式完成: account=%s, chunks=%d", lease.account.id, chunk_count)
                     if not cancelled and chunk_count == 0:
-                        logger.warning("生成错误回退响应 (0 chunks from upstream)")
+                        logger.warning(
+                            "生成错误回退响应 (0 chunks from upstream): account=%s, label=%s, model=%s",
+                            lease.account.id,
+                            lease.account.label,
+                            model,
+                        )
                         import time as _time
 
                         fallback = {
@@ -1225,7 +1230,10 @@ async def chat_completions_openai(request: Request):
                             "model": model,
                             "choices": [{
                                 "index": 0,
-                                "delta": {"role": "assistant", "content": "上游api返回空信息，可能是上下文超限了"},
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": "上游流式响应为空（0 chunks）。这通常是上游未返回任何 SSE 数据，常见于上下文超限、模型侧异常或上游代理吞流，请查看服务端日志。"
+                                },
                                 "finish_reason": "stop"
                             }]
                         }

@@ -15,8 +15,6 @@ logger = logging.getLogger("iflow2api")
 
 
 DEFAULT_BASE_URL = "https://apis.iflow.cn/v1"
-MODERN_UPSTREAM_COMPAT_MODE = "modern"
-LEGACY_UPSTREAM_COMPAT_MODE = "legacy_4c98d94"
 SUPPORTED_UPSTREAM_AUTH_TYPES = {"oauth-iflow", "cookie"}
 
 
@@ -168,7 +166,6 @@ class AppSettings(BaseModel):
     # - node_fetch: 使用 Node.js fetch，与官方 CLI 更接近
     # - httpx: 使用 Python/OpenSSL 默认 TLS 栈
     # - curl_cffi: 使用 curl-impersonate，可伪装为 Chrome/Node 风格握手
-    upstream_compat_mode: str = MODERN_UPSTREAM_COMPAT_MODE
     upstream_transport_backend: str = "node_fetch"
     tls_impersonate: str = "chrome124"
 
@@ -235,23 +232,8 @@ def prune_unsupported_upstream_accounts(settings: AppSettings) -> int:
     return removed_count
 
 
-def normalize_upstream_compat_mode(value: Any) -> str:
-    """规范化上游兼容模式。"""
-    normalized = str(value or "").strip()
-    if normalized == LEGACY_UPSTREAM_COMPAT_MODE:
-        return LEGACY_UPSTREAM_COMPAT_MODE
-    return MODERN_UPSTREAM_COMPAT_MODE
-
-
-def is_legacy_upstream_compat_mode(settings: AppSettings) -> bool:
-    """是否启用 4c98d94 左右的旧上游行为兼容模式。"""
-    return normalize_upstream_compat_mode(settings.upstream_compat_mode) == LEGACY_UPSTREAM_COMPAT_MODE
-
-
 def get_effective_upstream_transport_backend(settings: AppSettings) -> str:
     """解析当前实际生效的上游传输层。"""
-    if is_legacy_upstream_compat_mode(settings):
-        return "httpx"
     return settings.upstream_transport_backend
 
 
@@ -504,8 +486,6 @@ def load_settings() -> AppSettings:
                     settings.upstream_proxy = data["upstream_proxy"]
                 if "upstream_proxy_enabled" in data:
                     settings.upstream_proxy_enabled = data["upstream_proxy_enabled"]
-                if "upstream_compat_mode" in data:
-                    settings.upstream_compat_mode = normalize_upstream_compat_mode(data["upstream_compat_mode"])
                 # 上游传输层设置（TLS 指纹对齐）
                 if "upstream_transport_backend" in data:
                     settings.upstream_transport_backend = data["upstream_transport_backend"]
@@ -518,14 +498,10 @@ def load_settings() -> AppSettings:
     if removed_unsupported_accounts:
         logger.info("检测到并清理了 %d 个已废弃的 API Key 上游账号", removed_unsupported_accounts)
 
-    if (
-        not is_legacy_upstream_compat_mode(settings)
-        and (settings.base_url or DEFAULT_BASE_URL).rstrip("/") == DEFAULT_BASE_URL
-        and settings.upstream_transport_backend in {
+    if (settings.base_url or DEFAULT_BASE_URL).rstrip("/") == DEFAULT_BASE_URL and settings.upstream_transport_backend in {
         "httpx",
         "curl_cffi",
-    }
-    ):
+    }:
         logger.info(
             "检测到 legacy 传输层配置 backend=%s，已自动切换为 node_fetch 以对齐官方 iFlow CLI",
             settings.upstream_transport_backend,
@@ -555,7 +531,6 @@ def save_settings(settings: AppSettings) -> None:
     config_dir.mkdir(parents=True, exist_ok=True)
     settings.upstream_accounts = [_normalize_account(account) for account in settings.upstream_accounts]
     prune_unsupported_upstream_accounts(settings)
-    settings.upstream_compat_mode = normalize_upstream_compat_mode(settings.upstream_compat_mode)
     sync_legacy_auth_fields(settings)
 
     serialized_accounts = []
@@ -599,7 +574,6 @@ def save_settings(settings: AppSettings) -> None:
         # 上游代理设置
         "upstream_proxy": settings.upstream_proxy,
         "upstream_proxy_enabled": settings.upstream_proxy_enabled,
-        "upstream_compat_mode": normalize_upstream_compat_mode(settings.upstream_compat_mode),
         # 上游传输层设置（TLS 指纹对齐）
         "upstream_transport_backend": settings.upstream_transport_backend,
         "tls_impersonate": settings.tls_impersonate,

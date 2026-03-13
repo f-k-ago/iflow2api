@@ -1,6 +1,4 @@
 """API 代理服务 - 转发请求到 iFlow API"""
-
-import contextlib
 from dataclasses import dataclass
 import hmac
 import hashlib
@@ -181,29 +179,11 @@ class IFlowProxy:
         self.config = config
         self.base_url = config.base_url.rstrip("/")
         self._client: Optional[BaseUpstreamTransport] = None
-        from .settings import LEGACY_UPSTREAM_COMPAT_MODE, load_settings
 
-        runtime_settings = load_settings()
-        self._compat_mode = runtime_settings.upstream_compat_mode
-        self._legacy_compat_mode = self._compat_mode == LEGACY_UPSTREAM_COMPAT_MODE
-
-        # 保持会话一致性
-        if self._legacy_compat_mode:
-            # 旧实现按代理实例随机生成，会在每轮请求里漂移。
-            self._session_id = f"session-{uuid.uuid4()}"
-            self._conversation_id = str(uuid.uuid4())
-        else:
-            # 新实现优先复用账号持久化的 session / conversation id，降低漂移。
-            self._session_id = (config.session_id or "").strip() or f"session-{uuid.uuid4()}"
-            self._conversation_id = (config.conversation_id or "").strip() or str(uuid.uuid4())
+        # 优先复用账号持久化的 session / conversation id，降低漂移。
+        self._session_id = (config.session_id or "").strip() or f"session-{uuid.uuid4()}"
+        self._conversation_id = (config.conversation_id or "").strip() or str(uuid.uuid4())
         self._telemetry_user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, config.api_key or self._session_id))
-
-    @staticmethod
-    def _generate_traceparent() -> str:
-        """生成 W3C Trace Context 的 traceparent。"""
-        trace_id = secrets.token_hex(16)
-        parent_id = secrets.token_hex(8)
-        return f"00-{trace_id}-{parent_id}-01"
 
     @staticmethod
     def _build_trace_context(traceparent: Optional[str], conversation_id: str) -> dict[str, str]:
@@ -277,14 +257,6 @@ class IFlowProxy:
             "conversation-id": self._conversation_id,
         }
 
-        if self._legacy_compat_mode:
-            headers.update({
-                "accept": "*/*",
-                "accept-language": "*",
-                "sec-fetch-mode": "cors",
-                "accept-encoding": "br, gzip, deflate",
-            })
-
         # HMAC 签名：`${userAgent}:${sessionId}:${timestamp}`
         signature = generate_signature(
             IFLOW_CLI_USER_AGENT,
@@ -300,8 +272,6 @@ class IFlowProxy:
         # 同一轮请求链路中需复用同一个 traceparent（chat + telemetry）。
         if not traceparent:
             traceparent = get_current_traceparent() or None
-        if self._legacy_compat_mode and not traceparent:
-            traceparent = self._generate_traceparent()
         if traceparent:
             headers["traceparent"] = traceparent
 
@@ -519,113 +489,6 @@ class IFlowProxy:
         }
         await self._telemetry_post_gm("//aitrack.lifecycle.run_error", gokey)
 
-    async def _legacy_telemetry_post_gm(self, path: str, gokey: str) -> None:
-        """发送 4c98d94 左右版本使用的 gm.mmstat 事件。"""
-        try:
-            client = await self._get_client()
-            await client.post(
-                f"{MMSTAT_GM_BASE}{path}",
-                headers={
-                    "Content-Type": "application/json",
-                    "accept": "*/*",
-                    "accept-language": "*",
-                    "sec-fetch-mode": "cors",
-                    "user-agent": "node",
-                    "accept-encoding": "br, gzip, deflate",
-                },
-                json_body={"gmkey": "AI", "gokey": gokey},
-                timeout=10.0,
-            )
-        except Exception as exc:
-            logger.debug("legacy mmstat gm event failed (%s): %s", path, exc)
-
-    async def _legacy_telemetry_post_vgif(self) -> None:
-        """发送 4c98d94 左右版本使用的 v.gif 事件。"""
-        try:
-            client = await self._get_client()
-            payload = {
-                "logtype": "1",
-                "title": "iFlow-CLI",
-                "pre": "-",
-                "platformType": "pc",
-                "device_model": platform.system(),
-                "os": platform.system(),
-                "o": "win" if platform.system().lower().startswith("win") else platform.system().lower(),
-                "node_version": NODE_VERSION_EMULATED,
-                "language": "zh_CN.UTF-8",
-                "interactive": "0",
-                "iFlowEnv": "",
-                "_g_encode": "utf-8",
-                "pid": "iflow",
-                "_user_id": self._telemetry_user_id,
-            }
-            await client.post(
-                MMSTAT_VGIF_URL,
-                headers={
-                    "content-type": "text/plain;charset=UTF-8",
-                    "cache-control": "no-cache",
-                    "accept": "*/*",
-                    "accept-language": "*",
-                    "sec-fetch-mode": "cors",
-                    "user-agent": "node",
-                    "accept-encoding": "br, gzip, deflate",
-                },
-                data=urllib.parse.urlencode(payload),
-                timeout=10.0,
-            )
-        except Exception as exc:
-            logger.debug("legacy mmstat v.gif failed: %s", exc)
-
-    async def _legacy_emit_run_started(self, model: str, trace_id: str) -> str:
-        """发送 4c98d94 左右版本的 run_started。"""
-        observation_id = self._rand_observation_id()
-        gokey = (
-            f"pid=iflow"
-            f"&sam=iflow.cli.{self._conversation_id}.{trace_id}"
-            f"&trace_id={trace_id}"
-            f"&session_id={self._session_id}"
-            f"&conversation_id={self._conversation_id}"
-            f"&observation_id={observation_id}"
-            f"&model={urllib.parse.quote(model or '')}"
-            f"&tool="
-            f"&user_id={self._telemetry_user_id}"
-        )
-        await self._legacy_telemetry_post_gm("//aitrack.lifecycle.run_started", gokey)
-        await self._legacy_telemetry_post_vgif()
-        return observation_id
-
-    async def _legacy_emit_run_error(
-        self,
-        model: str,
-        trace_id: str,
-        parent_observation_id: str,
-        error: object,
-    ) -> None:
-        """发送 4c98d94 左右版本的 run_error。"""
-        observation_id = self._rand_observation_id()
-        formatted_error = urllib.parse.quote(self._format_telemetry_error(error))
-        gokey = (
-            f"pid=iflow"
-            f"&sam=iflow.cli.{self._conversation_id}.{trace_id}"
-            f"&trace_id={trace_id}"
-            f"&observation_id={observation_id}"
-            f"&parent_observation_id={parent_observation_id}"
-            f"&session_id={self._session_id}"
-            f"&conversation_id={self._conversation_id}"
-            f"&user_id={self._telemetry_user_id}"
-            f"&error_msg={formatted_error}"
-            f"&model={urllib.parse.quote(model or '')}"
-            f"&tool="
-            f"&toolName="
-            f"&toolArgs="
-            f"&cliVer={IFLOW_CLI_VERSION}"
-            f"&platform={urllib.parse.quote(platform.system().lower())}"
-            f"&arch={urllib.parse.quote(platform.machine().lower())}"
-            f"&nodeVersion={urllib.parse.quote(NODE_VERSION_EMULATED)}"
-            f"&osVersion={urllib.parse.quote(platform.platform())}"
-        )
-        await self._legacy_telemetry_post_gm("//aitrack.lifecycle.run_error", gokey)
-
     async def _get_client(self) -> BaseUpstreamTransport:
         """获取或创建上游传输层客户端。"""
         if self._client is None:
@@ -647,8 +510,7 @@ class IFlowProxy:
             if proxy:
                 logger.info("使用上游代理: %s", proxy)
             logger.info(
-                "上游传输层: compat_mode=%s, backend=%s, configured_backend=%s, tls_impersonate=%s",
-                self._compat_mode,
+                "上游传输层: backend=%s, configured_backend=%s, tls_impersonate=%s",
                 effective_backend,
                 settings.upstream_transport_backend,
                 settings.tls_impersonate,
@@ -1067,15 +929,6 @@ class IFlowProxy:
             )
         request_body = self._configure_model_request(request_body, model)
 
-        if self._legacy_compat_mode:
-            return await self._chat_completions_legacy_impl(
-                client=client,
-                request_body=request_body,
-                model=model,
-                preserve_reasoning=preserve_reasoning,
-                stream=stream,
-            )
-
         if stream:
             # 对于流式请求，使用 httpx 的 stream 方法实现真正的流式传输
             # 注意：不能使用 await client.post()，因为它会等待整个响应体下载完成
@@ -1092,6 +945,8 @@ class IFlowProxy:
                             buffer = b""
                             chunk_count = 0
                             completed_successfully = False
+                            upstream_status_code: int | None = None
+                            upstream_content_type = "unknown"
                             headers = self._get_headers(stream=True)
 
                             # 调试：打印请求详情
@@ -1114,11 +969,12 @@ class IFlowProxy:
                                     response.raise_for_status()
 
                                     # 记录上游响应信息以便调试
-                                    content_type = response.headers.get("content-type", "unknown")
-                                    logger.debug("上游响应: status=%d, content-type=%s", response.status_code, content_type)
+                                    upstream_status_code = response.status_code
+                                    upstream_content_type = response.headers.get("content-type", "unknown")
+                                    logger.debug("上游响应: status=%d, content-type=%s", response.status_code, upstream_content_type)
 
                                     # 如果上游没有返回 SSE 流（可能是 JSON 错误），读取并处理
-                                    if "text/event-stream" not in content_type and "application/octet-stream" not in content_type:
+                                    if "text/event-stream" not in upstream_content_type and "application/octet-stream" not in upstream_content_type:
                                         # 上游返回了非流式响应（可能是错误）
                                         raw_body = await response.aread()
                                         body_str = raw_body.decode("utf-8", errors="replace")
@@ -1211,7 +1067,12 @@ class IFlowProxy:
                                 raise
                             finally:
                                 if chunk_count == 0:
-                                    logger.warning("上游流式响应为空 (0 chunks)")
+                                    logger.warning(
+                                        "上游流式响应为空 (0 chunks): model=%s, status=%s, content-type=%s",
+                                        model,
+                                        upstream_status_code if upstream_status_code is not None else "unknown",
+                                        upstream_content_type,
+                                    )
                                 else:
                                     logger.debug("流式完成: 共 %d chunks", chunk_count)
                                 if completed_successfully and telemetry_session.parent_observation_id:
@@ -1271,157 +1132,6 @@ class IFlowProxy:
                                 except Exception as telemetry_err:
                                     logger.debug("emit run_error failed: %s", telemetry_err)
                             raise
-
-    async def _chat_completions_legacy_impl(
-        self,
-        *,
-        client: BaseUpstreamTransport,
-        request_body: dict,
-        model: str,
-        preserve_reasoning: bool,
-        stream: bool,
-    ) -> "dict | AsyncIterator[bytes]":
-        """回退到 4c98d94 左右的旧 transport / trace / telemetry 语义。"""
-        traceparent = self._generate_traceparent()
-        trace_id = self._extract_trace_id(traceparent)
-        parent_observation_id = ""
-        try:
-            parent_observation_id = await self._legacy_emit_run_started(model, trace_id)
-        except Exception as exc:
-            logger.debug("legacy emit run_started failed: %s", exc)
-
-        if stream:
-            async def stream_generator():
-                buffer = b""
-                chunk_count = 0
-                headers = self._get_headers(stream=True, traceparent=traceparent)
-
-                logger.debug("Legacy 流式请求 URL: %s/chat/completions", self.base_url)
-                logger.debug(
-                    "Legacy 流式请求头: %s",
-                    json.dumps({k: v for k, v in headers.items() if k != "Authorization"}, ensure_ascii=False),
-                )
-
-                try:
-                    async with client.stream(
-                        "POST",
-                        f"{self.base_url}/chat/completions",
-                        headers=headers,
-                        json_body=request_body,
-                        timeout=300.0,
-                    ) as response:
-                        response.raise_for_status()
-
-                        content_type = response.headers.get("content-type", "unknown")
-                        logger.debug("Legacy 上游响应: status=%d, content-type=%s", response.status_code, content_type)
-
-                        if "text/event-stream" not in content_type and "application/octet-stream" not in content_type:
-                            raw_body = await response.aread()
-                            body_str = raw_body.decode("utf-8", errors="replace")
-                            logger.debug("Legacy 上游非流式响应体: %s", body_str[:500])
-                            try:
-                                error_data = json.loads(body_str)
-                                error_msg = error_data.get("msg") or error_data.get("error", {}).get("message") or body_str[:200]
-                            except json.JSONDecodeError:
-                                error_msg = body_str[:200] or "上游返回空响应"
-
-                            if parent_observation_id:
-                                with contextlib.suppress(Exception):
-                                    await self._legacy_emit_run_error(model, trace_id, parent_observation_id, error_msg)
-
-                            error_chunk = {
-                                "id": f"error-{int(time.time())}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": request_body.get("model", "unknown"),
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": f"[API Error] {error_msg}"},
-                                    "finish_reason": "stop",
-                                }],
-                            }
-                            yield ("data: " + json.dumps(error_chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
-                            yield b"data: [DONE]\n\n"
-                            return
-
-                        async for chunk in response.aiter_bytes():
-                            buffer += chunk
-                            while b"\n" in buffer:
-                                line, buffer = buffer.split(b"\n", 1)
-                                line_str = line.decode("utf-8", errors="replace").strip()
-                                if not line_str:
-                                    yield b"\n"
-                                    continue
-                                chunk_count += 1
-                                if line_str.startswith("data:"):
-                                    data_str = line_str[5:].strip()
-                                    if data_str == "[DONE]":
-                                        yield b"data: [DONE]\n\n"
-                                        continue
-                                    try:
-                                        chunk_data = json.loads(data_str)
-                                        chunk_data = self._normalize_stream_chunk(chunk_data, preserve_reasoning)
-                                        yield ("data: " + json.dumps(chunk_data, ensure_ascii=False) + "\n\n").encode("utf-8")
-                                    except (json.JSONDecodeError, Exception):
-                                        yield (line_str + "\n").encode("utf-8")
-                                else:
-                                    yield (line_str + "\n").encode("utf-8")
-
-                        if buffer:
-                            line_str = buffer.decode("utf-8", errors="replace").strip()
-                            if line_str.startswith("data:"):
-                                data_str = line_str[5:].strip()
-                                if data_str != "[DONE]":
-                                    try:
-                                        chunk_data = json.loads(data_str)
-                                        chunk_data = self._normalize_stream_chunk(chunk_data, preserve_reasoning)
-                                        yield ("data: " + json.dumps(chunk_data, ensure_ascii=False) + "\n\n").encode("utf-8")
-                                    except (json.JSONDecodeError, Exception):
-                                        yield (line_str + "\n").encode("utf-8")
-                                else:
-                                    yield b"data: [DONE]\n\n"
-                            elif line_str:
-                                yield (line_str + "\n").encode("utf-8")
-                except Exception as exc:
-                    logger.error("Legacy 流式请求错误: %s", exc)
-                    if parent_observation_id:
-                        with contextlib.suppress(Exception):
-                            await self._legacy_emit_run_error(model, trace_id, parent_observation_id, exc)
-                    raise
-                finally:
-                    if chunk_count == 0:
-                        logger.warning("Legacy 上游流式响应为空 (0 chunks)")
-                    else:
-                        logger.debug("Legacy 流式完成: 共 %d chunks", chunk_count)
-
-            return stream_generator()
-
-        try:
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers=self._get_headers(traceparent=traceparent),
-                json_body=request_body,
-                timeout=300.0,
-            )
-            response.raise_for_status()
-            result = response.json()
-            upstream_error = parse_upstream_business_error(result)
-            if upstream_error is not None:
-                raise upstream_error
-
-            if "usage" not in result:
-                result["usage"] = {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                }
-
-            return self._normalize_response(result, preserve_reasoning)
-        except Exception as exc:
-            if parent_observation_id:
-                with contextlib.suppress(Exception):
-                    await self._legacy_emit_run_error(model, trace_id, parent_observation_id, exc)
-            raise
 
     async def proxy_request(
         self,
