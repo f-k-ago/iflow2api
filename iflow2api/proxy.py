@@ -1,10 +1,12 @@
 """API 代理服务 - 转发请求到 iFlow API"""
 
+from dataclasses import dataclass
 import hmac
 import hashlib
 import json
 import logging
 import re
+import traceback
 import time
 import uuid
 import secrets
@@ -106,6 +108,24 @@ def parse_upstream_business_error(payload: Any) -> UpstreamAPIError | None:
     return None
 
 
+@dataclass(slots=True)
+class TelemetrySession:
+    """一次上游调用对应的 telemetry 会话。"""
+
+    pid: str
+    scene_id: str
+    session_id: str
+    conversation_id: str
+    user_id: str
+    model: str
+    tool: str
+    traceparent: str
+    trace_id: str
+    sam: str
+    parent_observation_id: str
+    start_time_ms: int
+
+
 def generate_signature(user_agent: str, session_id: str, timestamp: int, api_key: str) -> str | None:
     """
     生成 iFlow API 签名 (HMAC-SHA256)
@@ -154,6 +174,30 @@ class IFlowProxy:
             "trace_id": trace_id,
             "sam": sam,
         }
+
+    def _start_telemetry_session(
+        self,
+        *,
+        model: str,
+        tool: str = "",
+        traceparent: Optional[str] = None,
+    ) -> TelemetrySession:
+        """创建一次请求对应的 telemetry 会话。"""
+        trace_context = self._build_trace_context(traceparent, self._conversation_id)
+        return TelemetrySession(
+            pid="iflow",
+            scene_id="cli",
+            session_id=self._session_id,
+            conversation_id=self._conversation_id,
+            user_id=self._telemetry_user_id,
+            model=model or "",
+            tool=tool,
+            traceparent=trace_context["traceparent"],
+            trace_id=trace_context["trace_id"],
+            sam=trace_context["sam"],
+            parent_observation_id=self._rand_observation_id(),
+            start_time_ms=int(time.time() * 1000),
+        )
 
     def _is_aone_endpoint(self) -> bool:
         """是否为 Aone 端点（iflow-cli 在此分支追加额外头）。"""
@@ -333,45 +377,76 @@ class IFlowProxy:
         except Exception as e:
             logger.debug("mmstat v.gif failed: %s", e)
 
-    async def _emit_run_started(self, model: str, trace_context: dict[str, str]) -> str:
-        observation_id = self._rand_observation_id()
+    @staticmethod
+    def _format_telemetry_error(exc: object) -> str:
+        """尽量贴近官方 recordError 的 message + stack 结构。"""
+        if isinstance(exc, BaseException):
+            headline = str(exc)
+            if exc.__cause__ is not None:
+                headline = f"{headline}:{exc.__cause__}"
+            stack = "".join(traceback.format_exception(exc)).strip()
+            if stack:
+                return f"{headline}\n{stack[:20000]}"
+            return headline
+        return str(exc)
+
+    async def _emit_run_started(self, session: TelemetrySession) -> None:
         gokey = {
-            "pid": "iflow",
-            "sam": trace_context["sam"],
-            "trace_id": trace_context["trace_id"],
-            "session_id": self._session_id,
-            "conversation_id": self._conversation_id,
-            "observation_id": observation_id,
-            "model": model or "",
-            "tool": "",
-            "user_id": self._telemetry_user_id,
+            "pid": session.pid,
+            "sam": session.sam,
+            "trace_id": session.trace_id,
+            "session_id": session.session_id,
+            "conversation_id": session.conversation_id,
+            "observation_id": session.parent_observation_id,
+            "model": session.model,
+            "tool": session.tool,
+            "user_id": session.user_id,
         }
         await self._telemetry_post_gm("//aitrack.lifecycle.run_started", gokey)
         await self._telemetry_post_vgif()
-        return observation_id
+
+    async def _emit_run_finished(self, session: TelemetrySession) -> None:
+        duration_ms = max(int(time.time() * 1000) - session.start_time_ms, 0)
+        gokey = {
+            "pid": session.pid,
+            "sam": session.sam,
+            "trace_id": session.trace_id,
+            "session_id": session.session_id,
+            "conversation_id": session.conversation_id,
+            "observation_id": self._rand_observation_id(),
+            "parent_observation_id": session.parent_observation_id,
+            "duration": duration_ms,
+            "model": session.model,
+            "tool": session.tool,
+            "sessionId": session.session_id,
+            "user_id": session.user_id,
+        }
+        await self._telemetry_post_gm("//aitrack.lifecycle.run_finished", gokey)
 
     async def _emit_run_error(
         self,
-        model: str,
-        trace_context: dict[str, str],
-        parent_observation_id: str,
-        error_msg: str,
+        session: TelemetrySession,
+        error: object,
+        *,
+        tool_name: str = "",
+        tool_args: Any = None,
     ) -> None:
+        formatted_error = self._format_telemetry_error(error)
         observation_id = self._rand_observation_id()
         gokey = {
-            "pid": "iflow",
-            "sam": trace_context["sam"],
-            "trace_id": trace_context["trace_id"],
+            "pid": session.pid,
+            "sam": session.sam,
+            "trace_id": session.trace_id,
             "observation_id": observation_id,
-            "parent_observation_id": parent_observation_id,
-            "session_id": self._session_id,
-            "conversation_id": self._conversation_id,
-            "user_id": self._telemetry_user_id,
-            "error_msg": error_msg,
-            "model": model or "",
-            "tool": "",
-            "toolName": "",
-            "toolArgs": None,
+            "parent_observation_id": session.parent_observation_id,
+            "session_id": session.session_id,
+            "conversation_id": session.conversation_id,
+            "user_id": session.user_id,
+            "error_msg": formatted_error,
+            "model": session.model,
+            "tool": session.tool,
+            "toolName": tool_name,
+            "toolArgs": json.dumps(tool_args, ensure_ascii=False) if tool_args is not None else None,
             "cliVer": IFLOW_CLI_VERSION,
             "platform": platform.system().lower(),
             "arch": platform.machine().lower(),
@@ -818,13 +893,11 @@ class IFlowProxy:
             )
         request_body = self._configure_model_request(request_body, model)
 
-        # 统一 trace 链路：同一轮 run_started/chat/run_error 复用同一份 trace 上下文。
+        # 统一 trace 链路：同一轮 run_started/chat/run_error/run_finished 复用同一份会话上下文。
         # 当前 iflow2api 没有完整接入官方的 OTel span 树，因此默认不凭空伪造 traceparent。
-        traceparent = None
-        trace_context = self._build_trace_context(traceparent, self._conversation_id)
-        parent_observation_id = ""
+        telemetry_session = self._start_telemetry_session(model=model, traceparent=None)
         try:
-            parent_observation_id = await self._emit_run_started(model, trace_context)
+            await self._emit_run_started(telemetry_session)
         except Exception as e:
             logger.debug("emit run_started failed: %s", e)
 
@@ -834,7 +907,11 @@ class IFlowProxy:
             async def stream_generator():
                 buffer = b""
                 chunk_count = 0
-                headers = self._get_headers(stream=True, traceparent=traceparent)
+                completed_successfully = False
+                headers = self._get_headers(
+                    stream=True,
+                    traceparent=telemetry_session.traceparent or None,
+                )
                 
                 # 调试：打印请求详情
                 logger.debug("流式请求 URL: %s/chat/completions", self.base_url)
@@ -876,9 +953,9 @@ class IFlowProxy:
                             except json.JSONDecodeError:
                                 error_msg = body_str[:200] or "上游返回空响应"
 
-                            if parent_observation_id:
+                            if telemetry_session.parent_observation_id:
                                 try:
-                                    await self._emit_run_error(model, trace_context, parent_observation_id, error_msg)
+                                    await self._emit_run_error(telemetry_session, error_msg)
                                 except Exception as telemetry_err:
                                     logger.debug("emit run_error failed: %s", telemetry_err)
 
@@ -940,12 +1017,14 @@ class IFlowProxy:
                                     yield b"data: [DONE]\n\n"
                             elif line_str:
                                 yield (line_str + "\n").encode("utf-8")
+
+                        completed_successfully = True
                                 
                 except Exception as e:
                     logger.error("流式请求错误: %s", e)
-                    if parent_observation_id:
+                    if telemetry_session.parent_observation_id:
                         try:
-                            await self._emit_run_error(model, trace_context, parent_observation_id, str(e))
+                            await self._emit_run_error(telemetry_session, e)
                         except Exception as telemetry_err:
                             logger.debug("emit run_error failed: %s", telemetry_err)
                     raise
@@ -954,13 +1033,18 @@ class IFlowProxy:
                         logger.warning("上游流式响应为空 (0 chunks)")
                     else:
                         logger.debug("流式完成: 共 %d chunks", chunk_count)
+                    if completed_successfully and telemetry_session.parent_observation_id:
+                        try:
+                            await self._emit_run_finished(telemetry_session)
+                        except Exception as telemetry_err:
+                            logger.debug("emit run_finished failed: %s", telemetry_err)
             
             return stream_generator()
         else:
             try:
                 response = await client.post(
                     f"{self.base_url}/chat/completions",
-                    headers=self._get_headers(traceparent=traceparent),
+                    headers=self._get_headers(traceparent=telemetry_session.traceparent or None),
                     json_body=request_body,
                     timeout=300.0,
                 )
@@ -983,11 +1067,17 @@ class IFlowProxy:
                 # OpenAI 兼容客户端（如 Kilo Code）只检查 content 字段
                 result = self._normalize_response(result, preserve_reasoning)
 
+                if telemetry_session.parent_observation_id:
+                    try:
+                        await self._emit_run_finished(telemetry_session)
+                    except Exception as telemetry_err:
+                        logger.debug("emit run_finished failed: %s", telemetry_err)
+
                 return result
             except Exception as e:
-                if parent_observation_id:
+                if telemetry_session.parent_observation_id:
                     try:
-                        await self._emit_run_error(model, trace_context, parent_observation_id, str(e))
+                        await self._emit_run_error(telemetry_session, e)
                     except Exception as telemetry_err:
                         logger.debug("emit run_error failed: %s", telemetry_err)
                 raise
