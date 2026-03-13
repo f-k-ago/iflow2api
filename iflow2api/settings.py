@@ -108,7 +108,7 @@ class AppSettings(BaseModel):
     # 例如: https://your-domain.com 或 http://your-ip:28000
     oauth_callback_base_url: str = ""  # 空字符串表示使用 localhost
 
-    # 上游主账号字段
+    # 上游兼容字段（无账号池时回退使用）
     api_key: str = ""
     base_url: str = DEFAULT_BASE_URL
 
@@ -164,7 +164,6 @@ class AppSettings(BaseModel):
     tls_impersonate: str = "chrome124"
 
     # 多账号池配置
-    primary_account_id: str = ""
     upstream_accounts: list[UpstreamAccount] = Field(default_factory=list)
 
 
@@ -182,7 +181,7 @@ def build_legacy_account(settings: AppSettings) -> Optional[UpstreamAccount]:
     return _normalize_account(
         UpstreamAccount(
             id="legacy-primary",
-            label="兼容主账号",
+            label="兼容账号",
             enabled=True,
             auth_type=(settings.auth_type or "api-key"),
             api_key=settings.api_key,
@@ -234,7 +233,6 @@ def sync_legacy_auth_fields(settings: AppSettings) -> AppSettings:
     primary_account = get_primary_account(settings)
     if not primary_account:
         if settings.upstream_accounts:
-            settings.primary_account_id = ""
             settings.api_key = ""
             settings.base_url = DEFAULT_BASE_URL
             settings.auth_type = "api-key"
@@ -246,7 +244,6 @@ def sync_legacy_auth_fields(settings: AppSettings) -> AppSettings:
             settings.cookie_expires_at = None
         return settings
 
-    settings.primary_account_id = ""
     settings.api_key = primary_account.api_key
     settings.base_url = primary_account.base_url
     settings.auth_type = primary_account.auth_type
@@ -262,8 +259,6 @@ def sync_legacy_auth_fields(settings: AppSettings) -> AppSettings:
 def upsert_upstream_account(
     settings: AppSettings,
     account: UpstreamAccount,
-    *,
-    make_primary: bool = True,
 ) -> UpstreamAccount:
     """新增或更新账号池中的账号。"""
     normalized = _normalize_account(account)
@@ -384,8 +379,6 @@ def load_settings() -> AppSettings:
                     settings.api_key = data["api_key"]
                 if "base_url" in data:
                     settings.base_url = data["base_url"]
-                if "primary_account_id" in data:
-                    settings.primary_account_id = data["primary_account_id"]
                 if "upstream_accounts" in data and isinstance(data["upstream_accounts"], list):
                     loaded_accounts: list[UpstreamAccount] = []
                     for raw_account in data["upstream_accounts"]:
@@ -493,7 +486,6 @@ def save_settings(settings: AppSettings) -> None:
         # iFlow 配置也保存到 iflow2api/config.json
         "api_key": settings.api_key,
         "base_url": settings.base_url,
-        "primary_account_id": settings.primary_account_id,
         "upstream_accounts": serialized_accounts,
         # OAuth 配置
         "auth_type": settings.auth_type,

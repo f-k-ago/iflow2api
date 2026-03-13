@@ -418,18 +418,18 @@ async def update_settings(
         settings.language = request.language
     if request.api_key is not None:
         if settings.upstream_accounts:
-            primary_account = get_primary_account(settings, include_disabled=True)
-            if primary_account and request.api_key.strip():
-                primary_account.api_key = request.api_key.strip()
-                upsert_upstream_account(settings, primary_account, make_primary=False)
+                primary_account = get_primary_account(settings, include_disabled=True)
+                if primary_account and request.api_key.strip():
+                    primary_account.api_key = request.api_key.strip()
+                    upsert_upstream_account(settings, primary_account)
         else:
             settings.api_key = request.api_key
     if request.base_url is not None:
         if settings.upstream_accounts:
-            primary_account = get_primary_account(settings, include_disabled=True)
-            if primary_account and request.base_url.strip():
-                primary_account.base_url = request.base_url.strip()
-                upsert_upstream_account(settings, primary_account, make_primary=False)
+                primary_account = get_primary_account(settings, include_disabled=True)
+                if primary_account and request.base_url.strip():
+                    primary_account.base_url = request.base_url.strip()
+                    upsert_upstream_account(settings, primary_account)
         else:
             settings.base_url = request.base_url
     if request.custom_api_key is not None:
@@ -490,7 +490,7 @@ async def create_upstream_account(
         api_key=request.api_key.strip(),
         base_url=(request.base_url or settings.base_url or DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL,
     )
-    saved_account = upsert_upstream_account(settings, account, make_primary=False)
+    saved_account = upsert_upstream_account(settings, account)
     save_settings(settings)
 
     from ..app import reload_proxy
@@ -591,7 +591,6 @@ async def delete_upstream_account(
 
     settings = load_settings()
     if not settings.upstream_accounts and account_id == "legacy-primary":
-        settings.primary_account_id = ""
         settings.api_key = ""
         settings.base_url = DEFAULT_BASE_URL
         settings.auth_type = "api-key"
@@ -758,7 +757,7 @@ async def cookie_login(
             cookie_expires_at=expired or None,
             email=resolved_email.strip(),
         )
-        saved_account = upsert_upstream_account(settings, account, make_primary=False)
+        saved_account = upsert_upstream_account(settings, account)
         save_settings(settings)
 
         # 重新加载代理实例
@@ -834,7 +833,7 @@ async def oauth_callback(
             email=(user_info.get("email") or "").strip(),
             phone=(user_info.get("phone") or "").strip(),
         )
-        saved_account = upsert_upstream_account(settings, account, make_primary=False)
+        saved_account = upsert_upstream_account(settings, account)
         save_settings(settings)
 
         # 重新加载代理实例

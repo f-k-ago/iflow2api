@@ -147,7 +147,7 @@ class OAuthTokenRefresher:
                 logger.info("账号已从配置中移除，跳过刷新结果写回: %s", account.id)
                 return False
 
-        upsert_upstream_account(settings, account, make_primary=False)
+        upsert_upstream_account(settings, account)
         save_settings(settings)
         return True
 

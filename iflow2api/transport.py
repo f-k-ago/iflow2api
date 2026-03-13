@@ -149,6 +149,8 @@ class _StreamingNodeFetchRawResponse:
                 if event_type == "end":
                     self._ended = True
                     break
+                if event_type == "aborted":
+                    raise NodeFetchBridgeError("Node fetch bridge 请求已取消")
                 if event_type == "error":
                     raise NodeFetchBridgeError(str(event.get("message") or "Node fetch bridge 请求失败"))
                 raise NodeFetchBridgeError(f"Node fetch bridge 返回了未知事件: {event_type!r}")
@@ -163,7 +165,11 @@ class _StreamingNodeFetchRawResponse:
         self._released = True
 
         if not self._ended:
-            await self._transport._reset_worker()
+            try:
+                await self._transport._cancel_request(self._request_id)
+                await self._transport._drain_terminal_event(self._request_id)
+            except Exception:
+                await self._transport._reset_worker()
 
         self._transport._release_request_lock()
 
@@ -200,6 +206,13 @@ def _node_bridge_payload(
         else:
             payload["data_text"] = str(data)
     return payload
+
+
+def _node_bridge_cancel_payload(request_id: str) -> dict[str, Any]:
+    return {
+        "action": "cancel",
+        "request_id": request_id,
+    }
 
 
 def _node_bridge_env(proxy: Optional[str]) -> dict[str, str]:
@@ -622,6 +635,9 @@ class NodeFetchTransport(BaseUpstreamTransport):
         stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
         await stdin.drain()
 
+    async def _cancel_request(self, request_id: str) -> None:
+        await self._send_bridge_request(_node_bridge_cancel_payload(request_id))
+
     async def _read_bridge_event(self, request_id: str) -> dict[str, Any]:
         process = await self._ensure_worker()
         stdout = process.stdout
@@ -648,6 +664,18 @@ class NodeFetchTransport(BaseUpstreamTransport):
                 await self._reset_worker()
                 raise NodeFetchBridgeError("Node fetch worker 请求序列错乱，request_id 不匹配")
             return event
+
+    async def _drain_terminal_event(self, request_id: str) -> None:
+        while True:
+            event = await self._read_bridge_event(request_id)
+            event_type = event.get("type")
+            if event_type == "chunk":
+                continue
+            if event_type in {"end", "aborted"}:
+                return
+            if event_type == "error":
+                raise NodeFetchBridgeError(str(event.get("message") or "Node fetch bridge 请求失败"))
+            raise NodeFetchBridgeError(f"Node fetch worker 返回了未知终止事件: {event_type!r}")
 
     async def _await_meta(self, request_id: str) -> tuple[int, dict[str, str]]:
         event = await self._read_bridge_event(request_id)
@@ -703,9 +731,18 @@ class NodeFetchTransport(BaseUpstreamTransport):
                     continue
                 if event_type == "end":
                     break
+                if event_type == "aborted":
+                    raise NodeFetchBridgeError("Node fetch bridge 请求已取消")
                 if event_type == "error":
                     raise NodeFetchBridgeError(str(event.get("message") or "Node fetch bridge 请求失败"))
                 raise NodeFetchBridgeError(f"Node fetch worker 返回了未知事件: {event_type!r}")
+        except asyncio.CancelledError:
+            try:
+                await self._cancel_request(request_id)
+                await self._drain_terminal_event(request_id)
+            except Exception:
+                await self._reset_worker()
+            raise
         finally:
             self._release_request_lock()
 

@@ -5,6 +5,7 @@ import readline from "node:readline";
 import { Agent, fetch, ProxyAgent, setGlobalDispatcher } from "undici";
 
 let dispatcherKey = null;
+const activeRequests = new Map();
 
 function appendParams(rawUrl, params) {
   const url = new URL(rawUrl);
@@ -58,13 +59,21 @@ async function ensureDispatcher(proxy) {
 async function handleRequest(spec) {
   const requestId = typeof spec.request_id === "string" ? spec.request_id : "";
   const timeoutMs = Number(spec.timeout_ms || 300000);
+  const requestState = {
+    controller: new AbortController(),
+    cancelled: false,
+    timedOut: false,
+  };
+  activeRequests.set(requestId, requestState);
 
   try {
     await ensureDispatcher(spec.proxy);
 
-    const controller = new AbortController();
     const timer = Number.isFinite(timeoutMs) && timeoutMs > 0
-      ? setTimeout(() => controller.abort(new Error(`Request timed out after ${timeoutMs}ms`)), timeoutMs)
+      ? setTimeout(() => {
+        requestState.timedOut = true;
+        requestState.controller.abort();
+      }, timeoutMs)
       : null;
 
     try {
@@ -72,7 +81,7 @@ async function handleRequest(spec) {
         method: spec.method || "GET",
         headers: spec.headers || {},
         body: buildBody(spec),
-        signal: controller.signal,
+        signal: requestState.controller.signal,
         redirect: spec.follow_redirects === false ? "manual" : "follow",
       });
 
@@ -119,14 +128,36 @@ async function handleRequest(spec) {
       }
     }
   } catch (error) {
+    if (requestState.cancelled) {
+      await writeEvent({
+        request_id: requestId,
+        type: "aborted",
+      });
+      return;
+    }
+
     await writeEvent({
       request_id: requestId,
       type: "error",
       name: error?.name || "Error",
-      message: error?.message || String(error),
+      message: requestState.timedOut
+        ? `Request timed out after ${timeoutMs}ms`
+        : (error?.message || String(error)),
       code: error?.code || null,
     });
+  } finally {
+    activeRequests.delete(requestId);
   }
+}
+
+function handleCancel(spec) {
+  const requestId = typeof spec.request_id === "string" ? spec.request_id : "";
+  const requestState = activeRequests.get(requestId);
+  if (!requestState) {
+    return;
+  }
+  requestState.cancelled = true;
+  requestState.controller.abort();
 }
 
 const rl = readline.createInterface({
@@ -141,7 +172,11 @@ for await (const line of rl) {
   }
   try {
     const spec = JSON.parse(text);
-    await handleRequest(spec);
+    if (spec?.action === "cancel") {
+      handleCancel(spec);
+      continue;
+    }
+    void handleRequest(spec);
   } catch (error) {
     await writeEvent({
       request_id: "",

@@ -5,7 +5,9 @@ import hmac
 import hashlib
 import json
 import logging
+import os
 import re
+import sys
 import traceback
 import time
 import uuid
@@ -29,6 +31,26 @@ MMSTAT_GM_BASE = "https://gm.mmstat.com"
 MMSTAT_VGIF_URL = "https://log.mmstat.com/v.gif"
 IFLOW_USERINFO_URL = "https://iflow.cn/api/oauth/getUserInfo"
 NODE_VERSION_EMULATED = "v22.22.0"
+OFFICIAL_VGIF_OS = {
+    "darwin": urllib.parse.quote("Mac OS X"),
+    "win32": "Windows",
+    "linux": "Linux",
+}
+OFFICIAL_VGIF_DEVICE_MODEL = {
+    "darwin": "Macintosh",
+    "win32": "Windows",
+    "linux": "Linux",
+}
+OFFICIAL_VGIF_PLATFORM = {
+    "darwin": "mac",
+    "win32": "win",
+}
+OFFICIAL_VGIF_SPM = {
+    ("default", True): "a2110qe.33796382.46182003.0.0",
+    ("default", False): "a2110qe.32214347.46097794.0.0",
+    ("aone", True): "a21111a.39011320.0.0.0",
+    ("aone", False): "a21111a.39011391.0.0.0",
+}
 
 OFFICIAL_MAX_NEW_TOKENS_EXACT = {
     "gemini-1.5-pro": 8192,
@@ -344,37 +366,47 @@ class IFlowProxy:
             logger.debug("mmstat gm event failed (%s): %s", path, e)
 
     async def _telemetry_post_vgif(self) -> None:
-        """发送 log.mmstat.com/v.gif 事件（简化版）。"""
+        """发送 log.mmstat.com/v.gif 事件（尽量贴近官方字段）。"""
+        cna = (self.config.cna or "").strip()
+        if not cna or os.getenv("DISABLE_SEND_PV"):
+            return
+
         try:
             client = await self._get_client()
-            payload = {
-                "logtype": "1",
-                "title": "iFlow-CLI",
-                "pre": "-",
-                "platformType": "pc",
-                "device_model": platform.system(),
-                "os": platform.system(),
-                "o": "win" if platform.system().lower().startswith("win") else platform.system().lower(),
-                "node_version": NODE_VERSION_EMULATED,
-                "language": "zh_CN.UTF-8",
-                "interactive": "0",
-                "iFlowEnv": "",
-                "_g_encode": "utf-8",
-                "pid": "iflow",
-                "_user_id": self._telemetry_user_id,
-            }
+            non_interactive = os.getenv("IFLOW_NON_INTERACTIVE") == "true"
+            platform_name = sys.platform
+            scene = "aone" if self._is_aone_endpoint() else "default"
+            spm_cnt = OFFICIAL_VGIF_SPM[(scene, non_interactive)]
+            payload = [
+                "logtype=1",
+                "title=iFlow-CLI",
+                "pre=-",
+                "scr=-",
+                f"cna={cna}",
+                f"spm-cnt={spm_cnt}",
+                "aplus",
+                "pid=iflow",
+                f"_user_id={self._telemetry_user_id}",
+                f"cache={secrets.randbelow(268435456):x}",
+                "sidx=aplusSidex",
+                "ckx=aplusCkx",
+                f"platformType={os.getenv('IFLOW_RUN_IN') or 'pc'}",
+                f"device_model={OFFICIAL_VGIF_DEVICE_MODEL.get(platform_name, platform_name)}",
+                f"os={OFFICIAL_VGIF_OS.get(platform_name, platform_name)}",
+                f"o={OFFICIAL_VGIF_PLATFORM.get(platform_name, platform_name)}",
+                f"node_version={NODE_VERSION_EMULATED}",
+                f"language={os.getenv('LANG') or ''}",
+                f"interactive={0 if non_interactive else 1}",
+                f"iFlowEnv={os.getenv('IFLOW_ENV') or ''}",
+                "_g_encode=utf-8",
+            ]
             await client.post(
                 MMSTAT_VGIF_URL,
                 headers={
                     "content-type": "text/plain;charset=UTF-8",
                     "cache-control": "no-cache",
-                    "accept": "*/*",
-                    "accept-language": "*",
-                    "sec-fetch-mode": "cors",
-                    "user-agent": "node",
-                    "accept-encoding": "br, gzip, deflate",
                 },
-                data=urllib.parse.urlencode(payload),
+                data="&".join(payload),
                 timeout=10.0,
             )
         except Exception as e:
