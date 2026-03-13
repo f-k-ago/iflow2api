@@ -130,9 +130,15 @@ function renderUpstreamAccounts(accounts, tableId, includeActions = false) {
             tr.innerHTML = `
                 <td>${labelText}</td>
                 <td>${escapeHtml(formatAuthType(account.auth_type))}</td>
-                <td>${escapeHtml(account.api_key_masked || '--')}<br><span class="hint">${escapeHtml(account.base_url || '')}</span></td>
-                <td>${escapeHtml(statusText)}<br><span class="hint">${escapeHtml(detailText || '--')}</span></td>
                 <td>
+                    <div class="table-primary-text">${escapeHtml(account.api_key_masked || '--')}</div>
+                    <div class="table-secondary-text">${escapeHtml(account.base_url || '') || '--'}</div>
+                </td>
+                <td>
+                    <div class="table-primary-text">${escapeHtml(statusText)}</div>
+                    <div class="table-secondary-text">${escapeHtml(detailText || '--')}</div>
+                </td>
+                <td class="account-actions-cell">
                     <button type="button" class="btn btn-secondary btn-sm" onclick="testUpstreamAccount('${account.id}')" ${!account.enabled ? 'disabled' : ''}>测试</button>
                     <button type="button" class="btn btn-secondary btn-sm" onclick="toggleUpstreamAccount('${account.id}', ${!account.enabled})">${account.enabled ? '停用' : '启用'}</button>
                     <button type="button" class="btn btn-danger btn-sm" onclick="deleteUpstreamAccount('${account.id}')">删除</button>
@@ -142,8 +148,14 @@ function renderUpstreamAccounts(accounts, tableId, includeActions = false) {
             tr.innerHTML = `
                 <td>${labelText}</td>
                 <td>${escapeHtml(formatAuthType(account.auth_type))}</td>
-                <td>${escapeHtml(account.api_key_masked || '--')}</td>
-                <td>${escapeHtml(statusText)}</td>
+                <td>
+                    <div class="table-primary-text">${escapeHtml(account.api_key_masked || '--')}</div>
+                    <div class="table-secondary-text">${escapeHtml(account.base_url || '') || '--'}</div>
+                </td>
+                <td>
+                    <div class="table-primary-text">${escapeHtml(statusText)}</div>
+                    <div class="table-secondary-text">${escapeHtml(detailText || '--')}</div>
+                </td>
             `;
         }
         tbody.appendChild(tr);
@@ -285,6 +297,7 @@ function showSection(sectionId) {
     // 更新标题
     const titles = {
         dashboard: '仪表盘',
+        accounts: '账号',
         settings: '设置',
         users: '用户管理',
         logs: '日志',

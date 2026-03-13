@@ -42,6 +42,10 @@
                     <span class="icon">📊</span>
                     <span>仪表盘</span>
                 </a>
+                <a href="#" class="nav-item" data-page="accounts">
+                    <span class="icon">👤</span>
+                    <span>账号</span>
+                </a>
                 <a href="#" class="nav-item" data-page="settings">
                     <span class="icon">⚙️</span>
                     <span>设置</span>
@@ -138,9 +142,12 @@
                                 </tr>
                             </table>
                         </div>
+                    </div>
+                </section>
 
-
-                    <div class="card full-width">
+                <!-- 账号页面 -->
+                <section id="accounts-section" class="section">
+                    <div class="card">
                         <div class="card-header">
                             <span class="icon">👤</span>
                             <span>账号信息</span>
@@ -178,7 +185,7 @@
                             </table>
                             <div class="form-group" style="margin-top: 16px;">
                                 <label>账号池</label>
-                                <table class="info-table" id="account-list-table">
+                                <table class="data-table account-table" id="account-list-table">
                                     <thead>
                                         <tr>
                                             <th>备注</th>
@@ -192,11 +199,7 @@
                             </div>
                         </div>
                     </div>
-                </section>
 
-                <!-- 设置页面 -->
-                <section id="settings-section" class="section">
-                    <!-- iFlow 配置 -->
                     <div class="card">
                         <div class="card-header">
                             <span class="icon">🔑</span>
@@ -218,7 +221,7 @@
                                 <p class="hint">参考 cpa 的手动回调方式：若部署在局域网或外网环境、浏览器无法自动回到当前管理页，请完成 OAuth 登录后，把最终回调地址完整粘贴到这里再提交。</p>
                                 <div class="form-group" style="margin-top: 20px;">
                                     <label>已配置账号</label>
-                                    <table class="info-table" id="upstream-accounts-table">
+                                    <table class="data-table account-table" id="upstream-accounts-table">
                                         <thead>
                                             <tr>
                                                 <th>备注</th>
@@ -234,7 +237,10 @@
                             </form>
                         </div>
                     </div>
+                </section>
 
+                <!-- 设置页面 -->
+                <section id="settings-section" class="section">
                     <div class="card">
                         <div class="card-header">
                             <span class="icon">🌐</span>

@@ -486,6 +486,55 @@ body {
     background: var(--bg-color);
 }
 
+.account-table {
+    table-layout: fixed;
+}
+
+.account-table th:nth-child(1),
+.account-table td:nth-child(1) {
+    width: 18%;
+}
+
+.account-table th:nth-child(2),
+.account-table td:nth-child(2) {
+    width: 14%;
+}
+
+.account-table th:nth-child(3),
+.account-table td:nth-child(3) {
+    width: 28%;
+}
+
+.account-table th:nth-child(4),
+.account-table td:nth-child(4) {
+    width: 20%;
+}
+
+.account-table th:nth-child(5),
+.account-table td:nth-child(5) {
+    width: 20%;
+}
+
+.table-primary-text {
+    font-weight: 500;
+    word-break: break-word;
+}
+
+.table-secondary-text {
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 12px;
+    word-break: break-all;
+}
+
+.account-actions-cell {
+    white-space: normal;
+}
+
+.account-actions-cell .btn {
+    margin: 0 8px 8px 0;
+}
+
 /* 日志容器 */
 .log-container {
     background: #1e1e1e;
