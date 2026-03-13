@@ -28,6 +28,9 @@ RUN uv sync --frozen --no-dev --active
 # 阶段2: 运行阶段
 FROM python:3.12-slim
 
+# 从官方 Node 运行时复制 node 二进制，供 upstream node_fetch bridge 使用
+COPY --from=node:24.14.0-slim /usr/local/bin/node /usr/local/bin/node
+
 # 安装运行时依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \

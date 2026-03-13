@@ -156,10 +156,11 @@ class AppSettings(BaseModel):
     upstream_proxy: str = ""
     upstream_proxy_enabled: bool = False
 
-    # 上游传输层配置（用于 TLS 指纹对齐）
+    # 上游传输层配置（用于尽量对齐官方 iFlow CLI 行为）
+    # - node_fetch: 使用 Node.js fetch，与官方 CLI 更接近
     # - httpx: 使用 Python/OpenSSL 默认 TLS 栈
     # - curl_cffi: 使用 curl-impersonate，可伪装为 Chrome/Node 风格握手
-    upstream_transport_backend: str = "httpx"
+    upstream_transport_backend: str = "node_fetch"
     tls_impersonate: str = "chrome124"
 
     # 多账号池配置
@@ -462,13 +463,15 @@ def load_settings() -> AppSettings:
         except Exception as _e:
             logger.warning("读取应用配置文件失败: %s", _e)
 
-    if (
-        settings.upstream_transport_backend == "curl_cffi"
-        and settings.tls_impersonate == "chrome124"
-        and (settings.base_url or DEFAULT_BASE_URL).rstrip("/") == DEFAULT_BASE_URL
-    ):
-        logger.info("检测到 legacy curl_cffi/chrome124 配置，已自动切换为 httpx 以对齐官方 iFlow CLI")
-        settings.upstream_transport_backend = "httpx"
+    if (settings.base_url or DEFAULT_BASE_URL).rstrip("/") == DEFAULT_BASE_URL and settings.upstream_transport_backend in {
+        "httpx",
+        "curl_cffi",
+    }:
+        logger.info(
+            "检测到 legacy 传输层配置 backend=%s，已自动切换为 node_fetch 以对齐官方 iFlow CLI",
+            settings.upstream_transport_backend,
+        )
+        settings.upstream_transport_backend = "node_fetch"
 
     if settings.upstream_accounts:
         sync_legacy_auth_fields(settings)
