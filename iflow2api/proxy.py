@@ -15,6 +15,7 @@ import urllib.parse
 
 from typing import Any, AsyncIterator, Literal, Optional, overload
 from .config import IFlowConfig
+from .tracing import get_current_traceparent, session_trace_context, span_context
 from .transport import BaseUpstreamTransport, create_upstream_transport
 
 logger = logging.getLogger("iflow2api")
@@ -166,7 +167,7 @@ class IFlowProxy:
     @staticmethod
     def _build_trace_context(traceparent: Optional[str], conversation_id: str) -> dict[str, str]:
         """构造与官方 currentSession 更接近的 trace 上下文。"""
-        normalized = (traceparent or "").strip()
+        normalized = (traceparent or get_current_traceparent() or "").strip()
         trace_id = IFlowProxy._extract_trace_id(normalized) if normalized else ""
         sam = f"iflow.cli.{conversation_id}.{trace_id}" if trace_id else ""
         return {
@@ -248,6 +249,8 @@ class IFlowProxy:
 
         # iflow-cli 中 traceparent 为“有则传”的可选头。
         # 同一轮请求链路中需复用同一个 traceparent（chat + telemetry）。
+        if not traceparent:
+            traceparent = get_current_traceparent() or None
         if traceparent:
             headers["traceparent"] = traceparent
 
@@ -893,194 +896,201 @@ class IFlowProxy:
             )
         request_body = self._configure_model_request(request_body, model)
 
-        # 统一 trace 链路：同一轮 run_started/chat/run_error/run_finished 复用同一份会话上下文。
-        # 当前 iflow2api 没有完整接入官方的 OTel span 树，因此默认不凭空伪造 traceparent。
-        telemetry_session = self._start_telemetry_session(model=model, traceparent=None)
-        try:
-            await self._emit_run_started(telemetry_session)
-        except Exception as e:
-            logger.debug("emit run_started failed: %s", e)
-
         if stream:
             # 对于流式请求，使用 httpx 的 stream 方法实现真正的流式传输
             # 注意：不能使用 await client.post()，因为它会等待整个响应体下载完成
             async def stream_generator():
-                buffer = b""
-                chunk_count = 0
-                completed_successfully = False
-                headers = self._get_headers(
-                    stream=True,
-                    traceparent=telemetry_session.traceparent or None,
-                )
-                
-                # 调试：打印请求详情
-                logger.debug("流式请求 URL: %s/chat/completions", self.base_url)
-                logger.debug("流式请求头: %s", json.dumps({k: v for k, v in headers.items() if k != 'Authorization'}, ensure_ascii=False))
-                logger.debug("流式请求体: model=%s, messages=%d, tools=%d",
-                             request_body.get('model'),
-                             len(request_body.get('messages', [])),
-                             len(request_body.get('tools', [])) if 'tools' in request_body else 0)
-                
-                try:
-                    async with client.stream(
-                        "POST",
-                        f"{self.base_url}/chat/completions",
-                        headers=headers,
-                        json_body=request_body,
-                        timeout=300.0,
-                    ) as response:
-                        # 检查状态码
-                        response.raise_for_status()
-                        
-                        # 记录上游响应信息以便调试
-                        content_type = response.headers.get("content-type", "unknown")
-                        logger.debug("上游响应: status=%d, content-type=%s", response.status_code, content_type)
-                        
-                        # 如果上游没有返回 SSE 流（可能是 JSON 错误），读取并处理
-                        if "text/event-stream" not in content_type and "application/octet-stream" not in content_type:
-                            # 上游返回了非流式响应（可能是错误）
-                            raw_body = await response.aread()
-                            body_str = raw_body.decode("utf-8", errors="replace")
-                            logger.debug("上游非流式响应体: %s", body_str[:500])
+                with span_context("iflow_cli_request", attributes={"model": model, "stream": True}):
+                    telemetry_session = self._start_telemetry_session(model=model, traceparent=None)
+                    with session_trace_context(telemetry_session.traceparent):
+                        try:
+                            await self._emit_run_started(telemetry_session)
+                        except Exception as e:
+                            logger.debug("emit run_started failed: %s", e)
+
+                        with span_context("iflow.chat.completions", attributes={"model": model, "stream": True}):
+                            buffer = b""
+                            chunk_count = 0
+                            completed_successfully = False
+                            headers = self._get_headers(stream=True)
+
+                            # 调试：打印请求详情
+                            logger.debug("流式请求 URL: %s/chat/completions", self.base_url)
+                            logger.debug("流式请求头: %s", json.dumps({k: v for k, v in headers.items() if k != 'Authorization'}, ensure_ascii=False))
+                            logger.debug("流式请求体: model=%s, messages=%d, tools=%d",
+                                         request_body.get('model'),
+                                         len(request_body.get('messages', [])),
+                                         len(request_body.get('tools', [])) if 'tools' in request_body else 0)
+
                             try:
-                                error_data = json.loads(body_str)
-                                upstream_error = parse_upstream_business_error(error_data)
-                                error_msg = (
-                                    str(upstream_error)
-                                    if upstream_error is not None
-                                    else error_data.get("msg") or error_data.get("error", {}).get("message") or body_str[:200]
-                                )
-                            except json.JSONDecodeError:
-                                error_msg = body_str[:200] or "上游返回空响应"
+                                async with client.stream(
+                                    "POST",
+                                    f"{self.base_url}/chat/completions",
+                                    headers=headers,
+                                    json_body=request_body,
+                                    timeout=300.0,
+                                ) as response:
+                                    # 检查状态码
+                                    response.raise_for_status()
 
-                            if telemetry_session.parent_observation_id:
-                                try:
-                                    await self._emit_run_error(telemetry_session, error_msg)
-                                except Exception as telemetry_err:
-                                    logger.debug("emit run_error failed: %s", telemetry_err)
+                                    # 记录上游响应信息以便调试
+                                    content_type = response.headers.get("content-type", "unknown")
+                                    logger.debug("上游响应: status=%d, content-type=%s", response.status_code, content_type)
 
-                            # 生成一个包含错误信息的 SSE chunk
-                            error_chunk = {
-                                "id": f"error-{int(time.time())}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": request_body.get("model", "unknown"),
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": f"[API Error] {error_msg}"},
-                                    "finish_reason": "stop"
-                                }]
-                            }
-                            yield ("data: " + json.dumps(error_chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
-                            yield b"data: [DONE]\n\n"
-                            return
-                        
-                        # 流式读取响应
-                        async for chunk in response.aiter_bytes():
-                            buffer += chunk
-                            # 按行处理 SSE 数据
-                            while b"\n" in buffer:
-                                line, buffer = buffer.split(b"\n", 1)
-                                line_str = line.decode("utf-8", errors="replace").strip()
-                                if not line_str:
-                                    yield b"\n"
-                                    continue
-                                chunk_count += 1
-                                if line_str.startswith("data:"):
-                                    data_str = line_str[5:].strip()
-                                    if data_str == "[DONE]":
+                                    # 如果上游没有返回 SSE 流（可能是 JSON 错误），读取并处理
+                                    if "text/event-stream" not in content_type and "application/octet-stream" not in content_type:
+                                        # 上游返回了非流式响应（可能是错误）
+                                        raw_body = await response.aread()
+                                        body_str = raw_body.decode("utf-8", errors="replace")
+                                        logger.debug("上游非流式响应体: %s", body_str[:500])
+                                        try:
+                                            error_data = json.loads(body_str)
+                                            upstream_error = parse_upstream_business_error(error_data)
+                                            error_msg = (
+                                                str(upstream_error)
+                                                if upstream_error is not None
+                                                else error_data.get("msg") or error_data.get("error", {}).get("message") or body_str[:200]
+                                            )
+                                        except json.JSONDecodeError:
+                                            error_msg = body_str[:200] or "上游返回空响应"
+
+                                        if telemetry_session.parent_observation_id:
+                                            try:
+                                                await self._emit_run_error(telemetry_session, error_msg)
+                                            except Exception as telemetry_err:
+                                                logger.debug("emit run_error failed: %s", telemetry_err)
+
+                                        # 生成一个包含错误信息的 SSE chunk
+                                        error_chunk = {
+                                            "id": f"error-{int(time.time())}",
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": request_body.get("model", "unknown"),
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {"content": f"[API Error] {error_msg}"},
+                                                "finish_reason": "stop"
+                                            }]
+                                        }
+                                        yield ("data: " + json.dumps(error_chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
                                         yield b"data: [DONE]\n\n"
-                                        continue
-                                    try:
-                                        chunk_data = json.loads(data_str)
-                                        chunk_data = self._normalize_stream_chunk(chunk_data, preserve_reasoning)
-                                        yield ("data: " + json.dumps(chunk_data, ensure_ascii=False) + "\n\n").encode("utf-8")
-                                    except (json.JSONDecodeError, Exception):
-                                        # 无法解析的 chunk 原样传递
-                                        yield (line_str + "\n").encode("utf-8")
-                                else:
-                                    yield (line_str + "\n").encode("utf-8")
-                        
-                        # 处理 buffer 中剩余数据（不以 \n 结尾的最后部分）
-                        if buffer:
-                            line_str = buffer.decode("utf-8", errors="replace").strip()
-                            if line_str.startswith("data:"):
-                                data_str = line_str[5:].strip()
-                                if data_str != "[DONE]":
-                                    try:
-                                        chunk_data = json.loads(data_str)
-                                        chunk_data = self._normalize_stream_chunk(chunk_data, preserve_reasoning)
-                                        yield ("data: " + json.dumps(chunk_data, ensure_ascii=False) + "\n\n").encode("utf-8")
-                                    except (json.JSONDecodeError, Exception):
-                                        yield (line_str + "\n").encode("utf-8")
-                                else:
-                                    yield b"data: [DONE]\n\n"
-                            elif line_str:
-                                yield (line_str + "\n").encode("utf-8")
+                                        return
 
-                        completed_successfully = True
-                                
-                except Exception as e:
-                    logger.error("流式请求错误: %s", e)
-                    if telemetry_session.parent_observation_id:
-                        try:
-                            await self._emit_run_error(telemetry_session, e)
-                        except Exception as telemetry_err:
-                            logger.debug("emit run_error failed: %s", telemetry_err)
-                    raise
-                finally:
-                    if chunk_count == 0:
-                        logger.warning("上游流式响应为空 (0 chunks)")
-                    else:
-                        logger.debug("流式完成: 共 %d chunks", chunk_count)
-                    if completed_successfully and telemetry_session.parent_observation_id:
-                        try:
-                            await self._emit_run_finished(telemetry_session)
-                        except Exception as telemetry_err:
-                            logger.debug("emit run_finished failed: %s", telemetry_err)
+                                    # 流式读取响应
+                                    async for chunk in response.aiter_bytes():
+                                        buffer += chunk
+                                        # 按行处理 SSE 数据
+                                        while b"\n" in buffer:
+                                            line, buffer = buffer.split(b"\n", 1)
+                                            line_str = line.decode("utf-8", errors="replace").strip()
+                                            if not line_str:
+                                                yield b"\n"
+                                                continue
+                                            chunk_count += 1
+                                            if line_str.startswith("data:"):
+                                                data_str = line_str[5:].strip()
+                                                if data_str == "[DONE]":
+                                                    yield b"data: [DONE]\n\n"
+                                                    continue
+                                                try:
+                                                    chunk_data = json.loads(data_str)
+                                                    chunk_data = self._normalize_stream_chunk(chunk_data, preserve_reasoning)
+                                                    yield ("data: " + json.dumps(chunk_data, ensure_ascii=False) + "\n\n").encode("utf-8")
+                                                except (json.JSONDecodeError, Exception):
+                                                    # 无法解析的 chunk 原样传递
+                                                    yield (line_str + "\n").encode("utf-8")
+                                            else:
+                                                yield (line_str + "\n").encode("utf-8")
+
+                                    # 处理 buffer 中剩余数据（不以 \n 结尾的最后部分）
+                                    if buffer:
+                                        line_str = buffer.decode("utf-8", errors="replace").strip()
+                                        if line_str.startswith("data:"):
+                                            data_str = line_str[5:].strip()
+                                            if data_str != "[DONE]":
+                                                try:
+                                                    chunk_data = json.loads(data_str)
+                                                    chunk_data = self._normalize_stream_chunk(chunk_data, preserve_reasoning)
+                                                    yield ("data: " + json.dumps(chunk_data, ensure_ascii=False) + "\n\n").encode("utf-8")
+                                                except (json.JSONDecodeError, Exception):
+                                                    yield (line_str + "\n").encode("utf-8")
+                                            else:
+                                                yield b"data: [DONE]\n\n"
+                                        elif line_str:
+                                            yield (line_str + "\n").encode("utf-8")
+
+                                    completed_successfully = True
+
+                            except Exception as e:
+                                logger.error("流式请求错误: %s", e)
+                                if telemetry_session.parent_observation_id:
+                                    try:
+                                        await self._emit_run_error(telemetry_session, e)
+                                    except Exception as telemetry_err:
+                                        logger.debug("emit run_error failed: %s", telemetry_err)
+                                raise
+                            finally:
+                                if chunk_count == 0:
+                                    logger.warning("上游流式响应为空 (0 chunks)")
+                                else:
+                                    logger.debug("流式完成: 共 %d chunks", chunk_count)
+                                if completed_successfully and telemetry_session.parent_observation_id:
+                                    try:
+                                        await self._emit_run_finished(telemetry_session)
+                                    except Exception as telemetry_err:
+                                        logger.debug("emit run_finished failed: %s", telemetry_err)
             
             return stream_generator()
         else:
-            try:
-                response = await client.post(
-                    f"{self.base_url}/chat/completions",
-                    headers=self._get_headers(traceparent=telemetry_session.traceparent or None),
-                    json_body=request_body,
-                    timeout=300.0,
-                )
-                response.raise_for_status()
-                result = response.json()
-                upstream_error = parse_upstream_business_error(result)
-                if upstream_error is not None:
-                    raise upstream_error
-
-                # 确保 usage 统计信息存在 (OpenAI 兼容)
-                if "usage" not in result:
-                    result["usage"] = {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                    }
-
-                # 规范化响应: 确保 content 字段有效
-                # GLM-5 等推理模型可能只返回 reasoning_content 而 content 为 null
-                # OpenAI 兼容客户端（如 Kilo Code）只检查 content 字段
-                result = self._normalize_response(result, preserve_reasoning)
-
-                if telemetry_session.parent_observation_id:
+            with span_context("iflow_cli_request", attributes={"model": model, "stream": False}):
+                telemetry_session = self._start_telemetry_session(model=model, traceparent=None)
+                with session_trace_context(telemetry_session.traceparent):
                     try:
-                        await self._emit_run_finished(telemetry_session)
-                    except Exception as telemetry_err:
-                        logger.debug("emit run_finished failed: %s", telemetry_err)
+                        await self._emit_run_started(telemetry_session)
+                    except Exception as e:
+                        logger.debug("emit run_started failed: %s", e)
 
-                return result
-            except Exception as e:
-                if telemetry_session.parent_observation_id:
-                    try:
-                        await self._emit_run_error(telemetry_session, e)
-                    except Exception as telemetry_err:
-                        logger.debug("emit run_error failed: %s", telemetry_err)
-                raise
+                    with span_context("iflow.chat.completions", attributes={"model": model, "stream": False}):
+                        try:
+                            response = await client.post(
+                                f"{self.base_url}/chat/completions",
+                                headers=self._get_headers(),
+                                json_body=request_body,
+                                timeout=300.0,
+                            )
+                            response.raise_for_status()
+                            result = response.json()
+                            upstream_error = parse_upstream_business_error(result)
+                            if upstream_error is not None:
+                                raise upstream_error
+
+                            # 确保 usage 统计信息存在 (OpenAI 兼容)
+                            if "usage" not in result:
+                                result["usage"] = {
+                                    "prompt_tokens": 0,
+                                    "completion_tokens": 0,
+                                    "total_tokens": 0,
+                                }
+
+                            # 规范化响应: 确保 content 字段有效
+                            # GLM-5 等推理模型可能只返回 reasoning_content 而 content 为 null
+                            # OpenAI 兼容客户端（如 Kilo Code）只检查 content 字段
+                            result = self._normalize_response(result, preserve_reasoning)
+
+                            if telemetry_session.parent_observation_id:
+                                try:
+                                    await self._emit_run_finished(telemetry_session)
+                                except Exception as telemetry_err:
+                                    logger.debug("emit run_finished failed: %s", telemetry_err)
+
+                            return result
+                        except Exception as e:
+                            if telemetry_session.parent_observation_id:
+                                try:
+                                    await self._emit_run_error(telemetry_session, e)
+                                except Exception as telemetry_err:
+                                    logger.debug("emit run_error failed: %s", telemetry_err)
+                            raise
 
     async def proxy_request(
         self,

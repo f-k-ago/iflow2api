@@ -290,7 +290,7 @@ def _mask_secret(value: str, head: int = 8, tail: int = 4) -> str:
     return f"{raw[:head]}...{raw[-tail:]}"
 
 
-def _serialize_upstream_account(account, *, primary_account_id: str) -> dict[str, Any]:
+def _serialize_upstream_account(account) -> dict[str, Any]:
     """序列化账号池条目给前端使用。"""
     from ..concurrency_limiter import get_concurrency_limiter
     from ..settings import DEFAULT_BASE_URL
@@ -300,7 +300,6 @@ def _serialize_upstream_account(account, *, primary_account_id: str) -> dict[str
         "id": account.id,
         "label": account.label,
         "enabled": account.enabled,
-        "is_primary": account.id == primary_account_id,
         "auth_type": account.auth_type,
         "api_key_masked": _mask_secret(account.api_key),
         "base_url": account.base_url or DEFAULT_BASE_URL,
@@ -313,9 +312,30 @@ def _serialize_upstream_account(account, *, primary_account_id: str) -> dict[str
     }
 
 
+def _materialize_legacy_account(settings) -> None:
+    """必要时把旧单账号字段转成账号池条目。"""
+    from ..settings import build_legacy_account
+
+    if settings.upstream_accounts:
+        return
+
+    legacy_account = build_legacy_account(settings)
+    if legacy_account is not None:
+        settings.upstream_accounts = [legacy_account]
+
+
+def _find_upstream_account(settings, account_id: str):
+    """在账号池中定位目标账号。"""
+    _materialize_legacy_account(settings)
+    for account in settings.upstream_accounts:
+        if account.id == account_id:
+            return account
+    return None
+
+
 @admin_router.get("/account-info")
 async def get_account_info(username: str = Depends(get_current_user)) -> dict[str, Any]:
-    """获取账号池概览与主账号信息。"""
+    """获取账号池概览与兼容代表账号信息。"""
     from ..settings import get_enabled_upstream_accounts, get_primary_account, list_upstream_accounts, load_settings
 
     settings = load_settings()
@@ -340,12 +360,11 @@ async def get_account_info(username: str = Depends(get_current_user)) -> dict[st
         "phone": primary_account.phone,
         "cookie_expires_at": primary_account.cookie_expires_at,
         "accounts": [
-            _serialize_upstream_account(account, primary_account_id=settings.primary_account_id)
+            _serialize_upstream_account(account)
             for account in accounts
         ],
         "total_accounts": len(accounts),
         "enabled_accounts": len(get_enabled_upstream_accounts(settings)),
-        "primary_account_id": settings.primary_account_id,
     }
     return account_info
 
@@ -370,7 +389,6 @@ async def get_settings(username: str = Depends(get_current_user)) -> dict[str, A
         # 上游代理设置
         "upstream_proxy": settings.upstream_proxy,
         "upstream_proxy_enabled": settings.upstream_proxy_enabled,
-        "primary_account_id": settings.primary_account_id,
         # 不返回 OAuth 敏感信息
     }
 
@@ -403,7 +421,7 @@ async def update_settings(
             primary_account = get_primary_account(settings, include_disabled=True)
             if primary_account and request.api_key.strip():
                 primary_account.api_key = request.api_key.strip()
-                upsert_upstream_account(settings, primary_account, make_primary=True)
+                upsert_upstream_account(settings, primary_account, make_primary=False)
         else:
             settings.api_key = request.api_key
     if request.base_url is not None:
@@ -411,7 +429,7 @@ async def update_settings(
             primary_account = get_primary_account(settings, include_disabled=True)
             if primary_account and request.base_url.strip():
                 primary_account.base_url = request.base_url.strip()
-                upsert_upstream_account(settings, primary_account, make_primary=True)
+                upsert_upstream_account(settings, primary_account, make_primary=False)
         else:
             settings.base_url = request.base_url
     if request.custom_api_key is not None:
@@ -451,10 +469,9 @@ async def get_upstream_accounts(username: str = Depends(get_current_user)) -> di
     accounts = list_upstream_accounts(settings)
     return {
         "accounts": [
-            _serialize_upstream_account(account, primary_account_id=settings.primary_account_id)
+            _serialize_upstream_account(account)
             for account in accounts
         ],
-        "primary_account_id": settings.primary_account_id,
     }
 
 
@@ -473,7 +490,7 @@ async def create_upstream_account(
         api_key=request.api_key.strip(),
         base_url=(request.base_url or settings.base_url or DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL,
     )
-    saved_account = upsert_upstream_account(settings, account, make_primary=not settings.primary_account_id)
+    saved_account = upsert_upstream_account(settings, account, make_primary=False)
     save_settings(settings)
 
     from ..app import reload_proxy
@@ -482,7 +499,7 @@ async def create_upstream_account(
     return {
         "success": True,
         "message": "账号已添加到账号池",
-        "account": _serialize_upstream_account(saved_account, primary_account_id=settings.primary_account_id),
+        "account": _serialize_upstream_account(saved_account),
     }
 
 
@@ -493,52 +510,75 @@ async def toggle_upstream_account(
     username: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """启用或停用上游账号。"""
-    from ..settings import build_legacy_account, load_settings, save_settings
+    from ..settings import load_settings, save_settings
 
     settings = load_settings()
-    if not settings.upstream_accounts and account_id == "legacy-primary":
-        legacy_account = build_legacy_account(settings)
-        if legacy_account is None:
-            raise HTTPException(status_code=404, detail="账号不存在")
-        legacy_account.enabled = request.enabled
-        settings.upstream_accounts = [legacy_account]
+    account = _find_upstream_account(settings, account_id)
+    if account is not None:
+        account.enabled = request.enabled
+        save_settings(settings)
+        from ..app import reload_proxy
 
-    for account in settings.upstream_accounts:
-        if account.id == account_id:
-            account.enabled = request.enabled
-            save_settings(settings)
-            from ..app import reload_proxy
-
-            reload_proxy()
-            return {"success": True, "message": "账号状态已更新"}
+        reload_proxy()
+        return {"success": True, "message": "账号状态已更新"}
 
     raise HTTPException(status_code=404, detail="账号不存在")
 
 
-@admin_router.post("/upstream-accounts/{account_id}/activate")
-async def activate_upstream_account(
+@admin_router.post("/upstream-accounts/{account_id}/test")
+async def test_upstream_account(
     account_id: str,
     username: str = Depends(get_current_user),
 ) -> dict[str, Any]:
-    """切换当前主账号。"""
-    from ..settings import build_legacy_account, load_settings, save_settings
+    """测试单个上游账号是否能完成最小 chat 请求。"""
+    from ..account_pool import build_iflow_config_from_account
+    from ..proxy import IFlowProxy
+    from ..settings import load_settings
 
     settings = load_settings()
-    if not settings.upstream_accounts and account_id == "legacy-primary":
-        legacy_account = build_legacy_account(settings)
-        if legacy_account is None:
-            raise HTTPException(status_code=404, detail="账号不存在")
-        settings.upstream_accounts = [legacy_account]
-    if settings.upstream_accounts and not any(account.id == account_id for account in settings.upstream_accounts):
+    account = _find_upstream_account(settings, account_id)
+    if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
+    if not account.enabled:
+        raise HTTPException(status_code=400, detail="账号已停用，请先启用后再测试")
+    if not (account.api_key or "").strip():
+        raise HTTPException(status_code=400, detail="账号缺少 API Key，无法测试")
 
-    settings.primary_account_id = account_id
-    save_settings(settings)
+    proxy = IFlowProxy(build_iflow_config_from_account(account))
+    models_to_try = ["glm-4.7", "deepseek-v3.2-chat", "qwen3-coder-plus"]
+    last_error: Exception | None = None
 
-    from ..app import reload_proxy
+    try:
+        for model in models_to_try:
+            try:
+                result = await proxy.chat_completions(
+                    {
+                        "model": model,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 16,
+                    },
+                    stream=False,
+                    apply_concurrency_limit=False,
+                )
+                choices = result.get("choices") or []
+                content = ""
+                if choices:
+                    message = choices[0].get("message") or {}
+                    content = str(message.get("content") or "").strip()
+                return {
+                    "success": True,
+                    "message": f"测试成功（{model}）",
+                    "model": model,
+                    "content_preview": content[:120],
+                }
+            except Exception as exc:
+                last_error = exc
+                continue
+    finally:
+        await proxy.close()
 
-    reload_proxy()
-    return {"success": True, "message": "主账号已切换"}
+    detail = str(last_error) if last_error is not None else "测试失败，未获取到有效响应"
+    raise HTTPException(status_code=502, detail=detail)
 
 
 @admin_router.delete("/upstream-accounts/{account_id}")
@@ -718,7 +758,7 @@ async def cookie_login(
             cookie_expires_at=expired or None,
             email=resolved_email.strip(),
         )
-        saved_account = upsert_upstream_account(settings, account, make_primary=True)
+        saved_account = upsert_upstream_account(settings, account, make_primary=False)
         save_settings(settings)
 
         # 重新加载代理实例
@@ -794,7 +834,7 @@ async def oauth_callback(
             email=(user_info.get("email") or "").strip(),
             phone=(user_info.get("phone") or "").strip(),
         )
-        saved_account = upsert_upstream_account(settings, account, make_primary=True)
+        saved_account = upsert_upstream_account(settings, account, make_primary=False)
         save_settings(settings)
 
         # 重新加载代理实例

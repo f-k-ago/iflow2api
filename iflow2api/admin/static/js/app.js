@@ -125,9 +125,7 @@ function renderUpstreamAccounts(accounts, tableId, includeActions = false) {
         const detailText = [account.email, account.phone, account.cookie_expires_at]
             .filter(Boolean)
             .join(' / ');
-        const labelText = account.is_primary
-            ? `${escapeHtml(account.label)} <span class="hint">(主账号)</span>`
-            : escapeHtml(account.label);
+        const labelText = escapeHtml(account.label);
 
         if (includeActions) {
             tr.innerHTML = `
@@ -136,7 +134,7 @@ function renderUpstreamAccounts(accounts, tableId, includeActions = false) {
                 <td>${escapeHtml(account.api_key_masked || '--')}<br><span class="hint">${escapeHtml(account.base_url || '')}</span></td>
                 <td>${escapeHtml(statusText)}<br><span class="hint">${escapeHtml(detailText || '--')}</span></td>
                 <td>
-                    <button class="btn btn-secondary btn-sm" onclick="activateUpstreamAccount('${account.id}')" ${account.is_primary ? 'disabled' : ''}>设为主账号</button>
+                    <button class="btn btn-secondary btn-sm" onclick="testUpstreamAccount('${account.id}')" ${!account.enabled ? 'disabled' : ''}>测试</button>
                     <button class="btn btn-secondary btn-sm" onclick="toggleUpstreamAccount('${account.id}', ${!account.enabled})">${account.enabled ? '停用' : '启用'}</button>
                     <button class="btn btn-danger btn-sm" onclick="deleteUpstreamAccount('${account.id}')">删除</button>
                 </td>
@@ -628,14 +626,13 @@ async function toggleUpstreamAccount(accountId, enabled) {
     }
 }
 
-async function activateUpstreamAccount(accountId) {
+async function testUpstreamAccount(accountId) {
     try {
-        await apiRequest(`/upstream-accounts/${accountId}/activate`, {
+        const result = await apiRequest(`/upstream-accounts/${accountId}/test`, {
             method: 'POST',
         });
-        showToast('主账号已切换', 'success');
-        loadSettings();
-        loadAccountInfo();
+        const preview = result.content_preview ? `：${result.content_preview}` : '';
+        showToast(result.message ? `${result.message}${preview}` : '账号测试正常', 'success');
     } catch (error) {
         showToast(error.message, 'error');
     }

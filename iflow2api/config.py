@@ -78,7 +78,7 @@ def _parse_datetime(value: Any) -> Optional[datetime]:
 
 
 def _select_primary_account(data: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """从账号池中选出当前主账号。"""
+    """从账号池中选出当前兼容代表账号。"""
     raw_accounts = data.get("upstream_accounts")
     if not isinstance(raw_accounts, list) or not raw_accounts:
         return None
@@ -86,16 +86,6 @@ def _select_primary_account(data: dict[str, Any]) -> Optional[dict[str, Any]]:
     accounts = [account for account in raw_accounts if isinstance(account, dict)]
     if not accounts:
         return None
-
-    primary_account_id = (data.get("primary_account_id") or "").strip()
-    accounts_by_id = {
-        str(account.get("id") or "").strip(): account
-        for account in accounts
-        if str(account.get("id") or "").strip()
-    }
-
-    if primary_account_id and primary_account_id in accounts_by_id:
-        return accounts_by_id[primary_account_id]
 
     for account in accounts:
         if account.get("enabled", True) and str(account.get("api_key") or "").strip():
@@ -138,7 +128,7 @@ def _build_config_from_mapping(raw: dict[str, Any]) -> IFlowConfig:
 
 
 def load_iflow_config() -> IFlowConfig:
-    """从 `~/.iflow2api/config.json` 加载运行时主账号。"""
+    """从 `~/.iflow2api/config.json` 加载运行时兼容代表账号。"""
     config_path = get_app_config_path()
     if not config_path.exists():
         raise FileNotFoundError(

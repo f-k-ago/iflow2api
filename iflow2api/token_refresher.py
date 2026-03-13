@@ -147,9 +147,7 @@ class OAuthTokenRefresher:
                 logger.info("账号已从配置中移除，跳过刷新结果写回: %s", account.id)
                 return False
 
-        current_primary_id = settings.primary_account_id
-        make_primary = account.id == "legacy-primary" or not current_primary_id or current_primary_id == account.id
-        upsert_upstream_account(settings, account, make_primary=make_primary)
+        upsert_upstream_account(settings, account, make_primary=False)
         save_settings(settings)
         return True
 

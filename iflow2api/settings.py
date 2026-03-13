@@ -208,16 +208,10 @@ def list_upstream_accounts(settings: AppSettings) -> list[UpstreamAccount]:
 
 
 def get_primary_account(settings: AppSettings, include_disabled: bool = False) -> Optional[UpstreamAccount]:
-    """获取主账号，供当前配置和信息展示使用。"""
+    """获取兼容代表账号，供当前配置和信息展示使用。"""
     accounts = list_upstream_accounts(settings)
     if not accounts:
         return None
-
-    accounts_by_id = {account.id: account for account in accounts}
-    if settings.primary_account_id:
-        account = accounts_by_id.get(settings.primary_account_id)
-        if account and (include_disabled or account.enabled):
-            return account
 
     for account in accounts:
         if include_disabled or account.enabled:
@@ -236,7 +230,7 @@ def get_enabled_upstream_accounts(settings: AppSettings) -> list[UpstreamAccount
 
 
 def sync_legacy_auth_fields(settings: AppSettings) -> AppSettings:
-    """把主账号同步回旧单账号字段，保证旧代码路径继续工作。"""
+    """把兼容代表账号同步回旧单账号字段，保证旧代码路径继续工作。"""
     primary_account = get_primary_account(settings)
     if not primary_account:
         if settings.upstream_accounts:
@@ -252,7 +246,7 @@ def sync_legacy_auth_fields(settings: AppSettings) -> AppSettings:
             settings.cookie_expires_at = None
         return settings
 
-    settings.primary_account_id = primary_account.id
+    settings.primary_account_id = ""
     settings.api_key = primary_account.api_key
     settings.base_url = primary_account.base_url
     settings.auth_type = primary_account.auth_type
@@ -311,9 +305,6 @@ def upsert_upstream_account(
         settings.upstream_accounts.append(normalized)
         saved_account = normalized
 
-    if make_primary:
-        settings.primary_account_id = saved_account.id
-
     sync_legacy_auth_fields(settings)
     return saved_account
 
@@ -324,8 +315,6 @@ def remove_upstream_account(settings: AppSettings, account_id: str) -> bool:
     settings.upstream_accounts = [account for account in settings.upstream_accounts if account.id != account_id]
     removed = len(settings.upstream_accounts) != original_count
     if removed:
-        if settings.primary_account_id == account_id:
-            settings.primary_account_id = ""
         sync_legacy_auth_fields(settings)
     return removed
 
