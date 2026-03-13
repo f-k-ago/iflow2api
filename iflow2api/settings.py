@@ -362,6 +362,7 @@ def get_config_path() -> Path:
 def load_settings() -> AppSettings:
     """加载配置"""
     settings = AppSettings()
+    migrated_legacy_transport_backend = False
 
     # 首先从 ~/.iflow2api/config.json 加载所有设置（包括 api_key）
     app_config_path = get_config_path()
@@ -454,9 +455,16 @@ def load_settings() -> AppSettings:
             settings.upstream_transport_backend,
         )
         settings.upstream_transport_backend = "node_fetch"
+        migrated_legacy_transport_backend = True
 
     if settings.upstream_accounts:
         sync_legacy_auth_fields(settings)
+
+    if migrated_legacy_transport_backend:
+        try:
+            save_settings(settings)
+        except Exception as persist_error:
+            logger.warning("legacy 传输层自动迁移已生效，但持久化失败: %s", persist_error)
 
     return settings
 
