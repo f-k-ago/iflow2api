@@ -114,14 +114,42 @@ class OAuthTokenRefresher:
         while not self._stop_event.is_set():
             try:
                 settings = load_settings()
-                for account in self._iter_refresh_candidates(settings):
+                accounts = self._iter_refresh_candidates(settings)
+                logger.info("开始轮询上游账号刷新状态: total=%d", len(accounts))
+                if not accounts:
+                    logger.info("本轮没有可轮询的上游账号")
+
+                for account in accounts:
                     config = build_iflow_config_from_account(account)
+                    logger.info(
+                        "轮询账号: account_id=%s, label=%s, auth_type=%s",
+                        account.id,
+                        self._account_label(account),
+                        config.auth_type or account.auth_type or "unknown",
+                    )
                     if config.auth_type == "oauth-iflow" and self._should_refresh(config):
                         logger.info("OAuth token 即将过期，开始刷新: account_id=%s", account.id)
-                        self._schedule_refresh(account, config)
+                        success = self._schedule_refresh(account, config)
+                        logger.info(
+                            "账号轮询结果: account_id=%s, auth_type=oauth-iflow, status=%s",
+                            account.id,
+                            "success" if success else "failed",
+                        )
                     elif config.auth_type == "cookie" and self._should_refresh_cookie(config):
                         logger.info("Cookie 模式 API Key 即将过期，开始刷新: account_id=%s", account.id)
-                        self._schedule_cookie_refresh(account, config)
+                        success = self._schedule_cookie_refresh(account, config)
+                        logger.info(
+                            "账号轮询结果: account_id=%s, auth_type=cookie, status=%s",
+                            account.id,
+                            "success" if success else "failed",
+                        )
+                    else:
+                        logger.info(
+                            "账号轮询结果: account_id=%s, auth_type=%s, status=skipped, reason=%s",
+                            account.id,
+                            config.auth_type or account.auth_type or "unknown",
+                            self._build_skip_reason(config),
+                        )
 
             except Exception as e:
                 logger.warning("检查 token 状态时出错: %s", e)
@@ -136,6 +164,36 @@ class OAuthTokenRefresher:
             for account in list_upstream_accounts(settings)
             if (account.api_key or account.oauth_access_token or account.cookie)
         ]
+
+    @staticmethod
+    def _account_label(account: UpstreamAccount) -> str:
+        """返回账号日志标签。"""
+        return (account.label or account.email or account.phone or "").strip() or "-"
+
+    def _build_skip_reason(self, config: IFlowConfig) -> str:
+        """给轮询日志提供跳过原因。"""
+        auth_type = config.auth_type or "unknown"
+        if auth_type == "oauth-iflow":
+            if not config.oauth_refresh_token:
+                return "missing_refresh_token"
+            expires_at = config.api_key_expires_at or config.oauth_expires_at
+            if not expires_at:
+                return "missing_expiry"
+            time_until_expiry = (expires_at - datetime.now()).total_seconds()
+            return f"not_due_yet({time_until_expiry/3600:.1f}h_left)"
+
+        if auth_type == "cookie":
+            if not config.cookie:
+                return "missing_cookie"
+            if not config.cookie_expires_at:
+                return "missing_cookie_expiry_but_should_refresh"
+            expires_at = self._parse_cookie_expire_time(config.cookie_expires_at)
+            if not expires_at:
+                return "unparseable_cookie_expiry_but_should_refresh"
+            time_until_expiry = (expires_at - datetime.now()).total_seconds()
+            return f"not_due_yet({time_until_expiry/3600:.1f}h_left)"
+
+        return "unsupported_auth_type"
 
     def _persist_account(self, account: UpstreamAccount) -> bool:
         """将刷新后的账号写回配置。"""
@@ -250,7 +308,7 @@ class OAuthTokenRefresher:
 
         return False
 
-    def _schedule_refresh(self, account: UpstreamAccount, config: IFlowConfig) -> None:
+    def _schedule_refresh(self, account: UpstreamAccount, config: IFlowConfig) -> bool:
         """
         安排 token 刷新任务（M-05 修复）
 
@@ -264,25 +322,27 @@ class OAuthTokenRefresher:
             # 在主事件循环中运行，避免创建新循环
             future = asyncio.run_coroutine_threadsafe(coro, self._loop)
             try:
-                future.result(timeout=60)  # 最多等待 60 秒
+                return bool(future.result(timeout=60))  # 最多等待 60 秒
             except Exception as e:
                 logger.error("Token 刷新失败: %s", e)
+                return False
         else:
             # 回退：创建临时隔离事件循环（仅后台线程使用）
-            asyncio.run(coro)
+            return bool(asyncio.run(coro))
 
-    def _schedule_cookie_refresh(self, account: UpstreamAccount, config: IFlowConfig) -> None:
+    def _schedule_cookie_refresh(self, account: UpstreamAccount, config: IFlowConfig) -> bool:
         """安排 Cookie 模式刷新任务。"""
         coro = self._refresh_cookie_with_retry(account, config)
 
         if self._loop and self._loop.is_running():
             future = asyncio.run_coroutine_threadsafe(coro, self._loop)
             try:
-                future.result(timeout=60)
+                return bool(future.result(timeout=60))
             except Exception as e:
                 logger.error("Cookie 模式刷新失败: %s", e)
+                return False
         else:
-            asyncio.run(coro)
+            return bool(asyncio.run(coro))
 
     async def _refresh_token_with_retry(self, account: UpstreamAccount, config: IFlowConfig) -> bool:
         """
