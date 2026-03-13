@@ -17,6 +17,7 @@ logger = logging.getLogger("iflow2api")
 DEFAULT_BASE_URL = "https://apis.iflow.cn/v1"
 MODERN_UPSTREAM_COMPAT_MODE = "modern"
 LEGACY_UPSTREAM_COMPAT_MODE = "legacy_4c98d94"
+SUPPORTED_UPSTREAM_AUTH_TYPES = {"oauth-iflow", "cookie"}
 
 
 class UpstreamAccount(BaseModel):
@@ -98,6 +99,11 @@ def _account_has_credentials(account: UpstreamAccount) -> bool:
     )
 
 
+def is_supported_upstream_auth_type(auth_type: Any) -> bool:
+    """判断上游账号认证类型是否仍受支持。"""
+    return str(auth_type or "").strip() in SUPPORTED_UPSTREAM_AUTH_TYPES
+
+
 class AppSettings(BaseModel):
     """应用配置"""
 
@@ -172,6 +178,9 @@ class AppSettings(BaseModel):
 
 def build_legacy_account(settings: AppSettings) -> Optional[UpstreamAccount]:
     """从旧单账号字段构造兼容账号。"""
+    if not is_supported_upstream_auth_type(settings.auth_type):
+        return None
+
     if not any(
         [
             (settings.api_key or "").strip(),
@@ -186,7 +195,7 @@ def build_legacy_account(settings: AppSettings) -> Optional[UpstreamAccount]:
             id="legacy-primary",
             label="兼容账号",
             enabled=True,
-            auth_type=(settings.auth_type or "api-key"),
+            auth_type=(settings.auth_type or "oauth-iflow"),
             api_key=settings.api_key,
             base_url=settings.base_url,
             oauth_access_token=settings.oauth_access_token,
@@ -198,6 +207,32 @@ def build_legacy_account(settings: AppSettings) -> Optional[UpstreamAccount]:
             email=settings.cookie_email,
         )
     )
+
+
+def prune_unsupported_upstream_accounts(settings: AppSettings) -> int:
+    """移除已不再支持的上游账号类型（如 api-key 直登）。"""
+    original_count = len(settings.upstream_accounts)
+    if original_count:
+        settings.upstream_accounts = [
+            _normalize_account(account)
+            for account in settings.upstream_accounts
+            if is_supported_upstream_auth_type(account.auth_type)
+        ]
+
+    removed_count = original_count - len(settings.upstream_accounts)
+
+    if not is_supported_upstream_auth_type(settings.auth_type):
+        settings.auth_type = ""
+        settings.api_key = ""
+        settings.base_url = DEFAULT_BASE_URL
+        settings.oauth_access_token = ""
+        settings.oauth_refresh_token = ""
+        settings.oauth_expires_at = None
+        settings.cookie = ""
+        settings.cookie_email = ""
+        settings.cookie_expires_at = None
+
+    return removed_count
 
 
 def normalize_upstream_compat_mode(value: Any) -> str:
@@ -223,7 +258,11 @@ def get_effective_upstream_transport_backend(settings: AppSettings) -> str:
 def list_upstream_accounts(settings: AppSettings) -> list[UpstreamAccount]:
     """返回当前设置中的账号列表；无池配置时回退到旧单账号字段。"""
     if settings.upstream_accounts:
-        return [_normalize_account(account) for account in settings.upstream_accounts]
+        return [
+            _normalize_account(account)
+            for account in settings.upstream_accounts
+            if is_supported_upstream_auth_type(account.auth_type)
+        ]
 
     legacy_account = build_legacy_account(settings)
     return [legacy_account] if legacy_account else []
@@ -255,16 +294,15 @@ def sync_legacy_auth_fields(settings: AppSettings) -> AppSettings:
     """把兼容代表账号同步回旧单账号字段，保证旧代码路径继续工作。"""
     primary_account = get_primary_account(settings)
     if not primary_account:
-        if settings.upstream_accounts:
-            settings.api_key = ""
-            settings.base_url = DEFAULT_BASE_URL
-            settings.auth_type = "api-key"
-            settings.oauth_access_token = ""
-            settings.oauth_refresh_token = ""
-            settings.oauth_expires_at = None
-            settings.cookie = ""
-            settings.cookie_email = ""
-            settings.cookie_expires_at = None
+        settings.api_key = ""
+        settings.base_url = DEFAULT_BASE_URL
+        settings.auth_type = ""
+        settings.oauth_access_token = ""
+        settings.oauth_refresh_token = ""
+        settings.oauth_expires_at = None
+        settings.cookie = ""
+        settings.cookie_email = ""
+        settings.cookie_expires_at = None
         return settings
 
     settings.api_key = primary_account.api_key
@@ -285,6 +323,8 @@ def upsert_upstream_account(
 ) -> UpstreamAccount:
     """新增或更新账号池中的账号。"""
     normalized = _normalize_account(account)
+    if not is_supported_upstream_auth_type(normalized.auth_type):
+        raise ValueError(f"不支持的上游账号类型: {normalized.auth_type}")
     now = _now_iso()
     normalized.updated_at = now
     if not normalized.created_at:
@@ -386,6 +426,7 @@ def load_settings() -> AppSettings:
     """加载配置"""
     settings = AppSettings()
     migrated_legacy_transport_backend = False
+    removed_unsupported_accounts = 0
 
     # 首先从 ~/.iflow2api/config.json 加载所有设置（包括 api_key）
     app_config_path = get_config_path()
@@ -473,6 +514,10 @@ def load_settings() -> AppSettings:
         except Exception as _e:
             logger.warning("读取应用配置文件失败: %s", _e)
 
+    removed_unsupported_accounts = prune_unsupported_upstream_accounts(settings)
+    if removed_unsupported_accounts:
+        logger.info("检测到并清理了 %d 个已废弃的 API Key 上游账号", removed_unsupported_accounts)
+
     if (
         not is_legacy_upstream_compat_mode(settings)
         and (settings.base_url or DEFAULT_BASE_URL).rstrip("/") == DEFAULT_BASE_URL
@@ -491,11 +536,11 @@ def load_settings() -> AppSettings:
     if settings.upstream_accounts:
         sync_legacy_auth_fields(settings)
 
-    if migrated_legacy_transport_backend:
+    if migrated_legacy_transport_backend or removed_unsupported_accounts:
         try:
             save_settings(settings)
         except Exception as persist_error:
-            logger.warning("legacy 传输层自动迁移已生效，但持久化失败: %s", persist_error)
+            logger.warning("配置自动迁移/清理已生效，但持久化失败: %s", persist_error)
 
     return settings
 
@@ -509,6 +554,7 @@ def save_settings(settings: AppSettings) -> None:
     config_dir = get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
     settings.upstream_accounts = [_normalize_account(account) for account in settings.upstream_accounts]
+    prune_unsupported_upstream_accounts(settings)
     settings.upstream_compat_mode = normalize_upstream_compat_mode(settings.upstream_compat_mode)
     sync_legacy_auth_fields(settings)
 

@@ -95,7 +95,6 @@ function escapeHtml(value) {
 
 function formatAuthType(authType) {
     const authTypeMap = {
-        'api-key': 'API Key',
         'oauth-iflow': 'OAuth',
         'cookie': 'Cookie',
         'not_logged_in': '未登录',

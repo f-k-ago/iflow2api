@@ -580,7 +580,7 @@ async def delete_upstream_account(
     if not settings.upstream_accounts and account_id == "legacy-primary":
         settings.api_key = ""
         settings.base_url = DEFAULT_BASE_URL
-        settings.auth_type = "api-key"
+        settings.auth_type = ""
         settings.oauth_access_token = ""
         settings.oauth_refresh_token = ""
         settings.oauth_expires_at = None

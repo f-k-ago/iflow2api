@@ -13,6 +13,7 @@ from .crypto import ConfigEncryption
 logger = logging.getLogger("iflow2api")
 
 DEFAULT_BASE_URL = "https://apis.iflow.cn/v1"
+SUPPORTED_RUNTIME_AUTH_TYPES = {"oauth-iflow", "cookie"}
 
 
 class IFlowConfig(BaseModel):
@@ -83,7 +84,12 @@ def _select_primary_account(data: dict[str, Any]) -> Optional[dict[str, Any]]:
     if not isinstance(raw_accounts, list) or not raw_accounts:
         return None
 
-    accounts = [account for account in raw_accounts if isinstance(account, dict)]
+    accounts = [
+        account
+        for account in raw_accounts
+        if isinstance(account, dict)
+        and str(account.get("auth_type") or "").strip() in SUPPORTED_RUNTIME_AUTH_TYPES
+    ]
     if not accounts:
         return None
 
@@ -143,6 +149,17 @@ def load_iflow_config() -> IFlowConfig:
 
     config_data = _select_primary_account(data) or data
     config = _build_config_from_mapping(config_data)
+
+    if (
+        (config.auth_type and config.auth_type not in SUPPORTED_RUNTIME_AUTH_TYPES)
+        or (
+            not config.auth_type
+            and config.api_key
+            and not config.oauth_access_token
+            and not config.cookie
+        )
+    ):
+        raise ValueError("iflow2api 配置中的 API Key 直登已废弃，请改用 OAuth 或 Cookie 登录")
 
     if not config.api_key:
         raise ValueError("iflow2api 配置中缺少 API Key\n请先通过 WebUI 完成登录")
