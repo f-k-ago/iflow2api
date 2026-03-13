@@ -9,9 +9,11 @@ import logging
 import os
 import shutil
 import uuid
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Optional
+from urllib.parse import urlencode
 
 import httpx
 
@@ -204,8 +206,32 @@ def _node_bridge_payload(
         if isinstance(data, bytes):
             payload["data_base64"] = base64.b64encode(data).decode("ascii")
         else:
-            payload["data_text"] = str(data)
+            payload["data_text"] = _serialize_node_bridge_data(headers, data)
     return payload
+
+
+def _serialize_node_bridge_data(
+    headers: Optional[dict[str, str]],
+    data: Any,
+) -> str:
+    """为 Node bridge 序列化请求体。"""
+    if _is_form_urlencoded(headers) and not isinstance(data, str):
+        if isinstance(data, Mapping) or isinstance(data, (list, tuple)):
+            return urlencode(data, doseq=True)
+    return str(data)
+
+
+def _is_form_urlencoded(headers: Optional[dict[str, str]]) -> bool:
+    """判断请求头是否声明 x-www-form-urlencoded。"""
+    if not headers:
+        return False
+
+    for key, value in headers.items():
+        if key.lower() != "content-type":
+            continue
+        media_type = str(value).split(";", 1)[0].strip().lower()
+        return media_type == "application/x-www-form-urlencoded"
+    return False
 
 
 def _node_bridge_cancel_payload(request_id: str) -> dict[str, Any]:
