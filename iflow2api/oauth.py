@@ -60,12 +60,12 @@ class IFlowOAuth:
     async def _get_client(self) -> BaseUpstreamTransport:
         """获取或创建上游传输层客户端。"""
         if self._client is None:
-            from .settings import load_settings
+            from .settings import get_effective_upstream_transport_backend, load_settings
 
             settings = load_settings()
             proxy = settings.upstream_proxy if settings.upstream_proxy_enabled and settings.upstream_proxy else None
             self._client = create_upstream_transport(
-                backend=settings.upstream_transport_backend,
+                backend=get_effective_upstream_transport_backend(settings),
                 timeout=30.0,
                 follow_redirects=True,
                 proxy=proxy,

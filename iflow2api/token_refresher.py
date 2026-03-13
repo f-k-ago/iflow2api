@@ -695,13 +695,13 @@ async def check_api_key_validity(api_key: str, base_url: str = "https://apis.ifl
     client = None
     try:
         # 加载代理与传输层配置
-        from .settings import load_settings
+        from .settings import get_effective_upstream_transport_backend, load_settings
 
         settings = load_settings()
         proxy = settings.upstream_proxy if settings.upstream_proxy_enabled and settings.upstream_proxy else None
 
         client = create_upstream_transport(
-            backend=settings.upstream_transport_backend,
+            backend=get_effective_upstream_transport_backend(settings),
             timeout=10.0,
             follow_redirects=True,
             proxy=proxy,

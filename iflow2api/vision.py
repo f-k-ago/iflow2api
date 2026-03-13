@@ -11,7 +11,7 @@
 
 import base64
 import hashlib
-from typing import Optional, Union, Any
+from typing import Optional, Any
 from dataclasses import dataclass
 
 from .transport import create_upstream_transport
@@ -201,13 +201,13 @@ async def fetch_image_as_base64(url: str, timeout: float = 30.0) -> tuple[str, s
     client = None
     try:
         # 加载代理与传输层配置
-        from .settings import load_settings
+        from .settings import get_effective_upstream_transport_backend, load_settings
 
         settings = load_settings()
         proxy = settings.upstream_proxy if settings.upstream_proxy_enabled and settings.upstream_proxy else None
 
         client = create_upstream_transport(
-            backend=settings.upstream_transport_backend,
+            backend=get_effective_upstream_transport_backend(settings),
             timeout=timeout,
             follow_redirects=True,
             proxy=proxy,

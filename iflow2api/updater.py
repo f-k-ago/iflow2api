@@ -1,6 +1,5 @@
 """检查更新模块"""
 
-import asyncio
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -120,13 +119,13 @@ async def get_latest_release(timeout: float = 10.0) -> Optional[ReleaseInfo]:
     client = None
     try:
         # 加载代理与传输层配置
-        from .settings import load_settings
+        from .settings import get_effective_upstream_transport_backend, load_settings
 
         settings = load_settings()
         proxy = settings.upstream_proxy if settings.upstream_proxy_enabled and settings.upstream_proxy else None
 
         client = create_upstream_transport(
-            backend=settings.upstream_transport_backend,
+            backend=get_effective_upstream_transport_backend(settings),
             timeout=timeout,
             follow_redirects=True,
             proxy=proxy,
