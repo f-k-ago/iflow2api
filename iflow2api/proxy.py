@@ -27,6 +27,31 @@ MMSTAT_VGIF_URL = "https://log.mmstat.com/v.gif"
 IFLOW_USERINFO_URL = "https://iflow.cn/api/oauth/getUserInfo"
 NODE_VERSION_EMULATED = "v22.22.0"
 
+OFFICIAL_MAX_NEW_TOKENS_EXACT = {
+    "gemini-1.5-pro": 8192,
+    "gemini-1.5-flash": 65536,
+    "gemini-2.5-pro-preview-05-06": 65536,
+    "gemini-2.5-pro-preview-06-05": 65536,
+    "gemini-2.5-pro": 65536,
+    "gemini-2.5-flash-preview-05-20": 65536,
+    "gemini-2.5-flash": 65536,
+    "gemini-2.0-flash": 65536,
+    "gemini-2.0-flash-preview-image-generation": 8192,
+}
+
+OFFICIAL_MAX_NEW_TOKENS_PATTERNS = (
+    (re.compile(r"kimi", re.IGNORECASE), {"k2.5": 32768, "k2-0905": 32000, "k2-thinking": 32000, "ide-modelscope": 8192, "default": 32000}, None),
+    (re.compile(r"iFlow-ROME-30BA3B", re.IGNORECASE), {"default": 64000}, None),
+    (re.compile(r"minimax", re.IGNORECASE), {"default": 64000}, None),
+    (re.compile(r"glm", re.IGNORECASE), {"-5": 32000, "4.7": 32000, "ide-modelscope": 16384}, 32000),
+    (re.compile(r"claude", re.IGNORECASE), {}, 64000),
+    (re.compile(r"deepseek", re.IGNORECASE), {"v3.2-reasoner": 64000, "v3": 8192, "r1": 32000, "default": 8000}, None),
+    (re.compile(r"qwen3", re.IGNORECASE), {"coder": 64000, "max-preview": 32000, "default": 8192}, None),
+    (re.compile(r"qwen", re.IGNORECASE), {"max": 8192, "plus": 8192, "default": 8000}, None),
+    (re.compile(r"gpt", re.IGNORECASE), {"32k": 4096, "default": 16384}, None),
+    (re.compile(r"mimo", re.IGNORECASE), {"default": 64000}, None),
+)
+
 
 class UpstreamAPIError(Exception):
     """上游 API 返回的业务错误。"""
@@ -119,12 +144,9 @@ class IFlowProxy:
         self._telemetry_user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, config.api_key or self._session_id))
 
     @staticmethod
-    def _generate_traceparent() -> str:
-        """生成 W3C Trace Context 的 traceparent。"""
-        # 00-<32hex trace_id>-<16hex parent_id>-01
-        trace_id = secrets.token_hex(16)
-        parent_id = secrets.token_hex(8)
-        return f"00-{trace_id}-{parent_id}-01"
+    def _generate_trace_id() -> str:
+        """生成与 telemetry 对齐的 trace_id。"""
+        return secrets.token_hex(16)
 
     def _is_aone_endpoint(self) -> bool:
         """是否为 Aone 端点（iflow-cli 在此分支追加额外头）。"""
@@ -191,6 +213,57 @@ class IFlowProxy:
         if len(parts) == 4 and len(parts[1]) == 32:
             return parts[1]
         return secrets.token_hex(16)
+
+    @staticmethod
+    def _resolve_official_max_new_tokens(model: str, explicit_max_tokens: object = None) -> int:
+        """对齐官方 MOt(...) 的 max_new_tokens 计算。"""
+        if isinstance(explicit_max_tokens, int) and explicit_max_tokens > 0:
+            return explicit_max_tokens
+        if not model or not isinstance(model, str):
+            return 8000
+        if model in OFFICIAL_MAX_NEW_TOKENS_EXACT:
+            return OFFICIAL_MAX_NEW_TOKENS_EXACT[model]
+
+        model_lower = model.lower()
+        for pattern, limits, default_limit in OFFICIAL_MAX_NEW_TOKENS_PATTERNS:
+            if not pattern.search(model_lower):
+                continue
+            for key, value in limits.items():
+                if key != "default" and key in model_lower:
+                    return value
+            if "default" in limits:
+                return limits["default"]
+            if default_limit is not None:
+                return default_limit
+            break
+        return 8000
+
+    @staticmethod
+    def _get_thinking_enabled(body: dict) -> Optional[bool]:
+        """从请求体中提取显式 thinking 开关。"""
+        thinking = body.get("thinking")
+        if isinstance(thinking, dict):
+            if thinking.get("enabled") is True:
+                return True
+            if thinking.get("enabled") is False:
+                return False
+            thinking_type = str(thinking.get("type") or "").strip().lower()
+            if thinking_type == "enabled":
+                return True
+            if thinking_type == "disabled":
+                return False
+
+        if "enable_thinking" in body:
+            return bool(body["enable_thinking"])
+
+        chat_template_kwargs = body.get("chat_template_kwargs")
+        if isinstance(chat_template_kwargs, dict) and "enable_thinking" in chat_template_kwargs:
+            return bool(chat_template_kwargs["enable_thinking"])
+
+        if body.get("thinking_mode") is True or body.get("reasoning") is True:
+            return True
+
+        return None
 
     @staticmethod
     def _rand_observation_id() -> str:
@@ -419,7 +492,6 @@ class IFlowProxy:
 
         观测到官方 CLI 在 chat/completions 会补齐：
         - stream=true 时额外携带 stream_options.include_usage=true
-        - max_new_tokens
         - 不会显式补 temperature/top_p/tools=[]
 
         并且不会把 transport 层的 stream 字段透传给上游 body。
@@ -435,14 +507,9 @@ class IFlowProxy:
         else:
             body.pop("stream_options", None)
 
-        if "max_new_tokens" not in body:
-            max_tokens = body.get("max_tokens")
-            body["max_new_tokens"] = max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else 8192
-
         return body
 
-    @staticmethod
-    def _configure_model_request(request_body: dict, model: str) -> dict:
+    def _configure_model_request(self, request_body: dict, model: str) -> dict:
         """
         为特定模型配置必要的请求参数
         
@@ -471,10 +538,11 @@ class IFlowProxy:
         # 创建请求体副本
         body = request_body.copy()
         model_lower = model.lower()
-        
+        thinking_enabled = self._get_thinking_enabled(body)
+
         # 1. DeepSeek 模型
         # configureRequest:(e,r)=>{r.reasoningLevel!=="low"&&(e.reasoning=!0),e.thinking_mode=!0}
-        if model_lower.startswith("deepseek"):
+        if model_lower.startswith("deepseek") and thinking_enabled is True:
             if "thinking_mode" not in body:
                 body["thinking_mode"] = True
             if "reasoning" not in body:
@@ -485,81 +553,92 @@ class IFlowProxy:
         # configureRequest:e=>{e.chat_template_kwargs={enable_thinking:!0},e.enable_thinking=!0,e.thinking={type:"enabled"}}
         elif model == "glm-5":
             if "chat_template_kwargs" not in body:
-                body["chat_template_kwargs"] = {"enable_thinking": True}
+                body["chat_template_kwargs"] = {"enable_thinking": thinking_enabled is True}
             if "enable_thinking" not in body:
-                body["enable_thinking"] = True
+                body["enable_thinking"] = thinking_enabled is True
             if "thinking" not in body:
-                body["thinking"] = {"type": "enabled"}
+                body["thinking"] = {"type": "enabled" if thinking_enabled is True else "disabled"}
             body["temperature"] = 1
             body["top_p"] = 0.95
-            logger.debug("为模型 %s 添加思考参数: chat_template_kwargs, enable_thinking, thinking", model)
-        
+            logger.debug(
+                "为模型 %s 对齐思考参数: enable_thinking=%s",
+                model,
+                thinking_enabled is True,
+            )
+
         # 3. GLM-4.7 模型
         # configureRequest:e=>{e.chat_template_kwargs={enable_thinking:!0}}
         elif model == "glm-4.7":
             if "chat_template_kwargs" not in body:
-                body["chat_template_kwargs"] = {"enable_thinking": True}
+                body["chat_template_kwargs"] = {"enable_thinking": thinking_enabled is True}
             body["temperature"] = 1
             body["top_p"] = 0.95
-            logger.debug("为模型 %s 添加思考参数: chat_template_kwargs", model)
-        
+            logger.debug(
+                "为模型 %s 对齐思考参数: chat_template_kwargs.enable_thinking=%s",
+                model,
+                thinking_enabled is True,
+            )
+
         # 4. 其他 GLM 模型
         # configureRequest:e=>{e.chat_template_kwargs={enable_thinking:!0}}
-        elif model_lower.startswith("glm-"):
+        elif model_lower.startswith("glm-") and thinking_enabled is True:
             if "chat_template_kwargs" not in body:
                 body["chat_template_kwargs"] = {"enable_thinking": True}
             logger.debug("为模型 %s 添加思考参数: chat_template_kwargs", model)
-        
+
         # 5. Kimi-K2.5 模型
         # configureRequest:(e,r)=>{e.thinking={type:"enabled"}}
         elif model_lower.startswith("kimi-k2.5"):
             if "thinking" not in body:
-                body["thinking"] = {"type": "enabled"}
-            logger.debug("为模型 %s 添加思考参数: thinking", model)
-        
+                body["thinking"] = {"type": "enabled" if thinking_enabled is True else "disabled"}
+            logger.debug("为模型 %s 对齐思考参数: thinking=%s", model, body["thinking"])
+
         # 6. 包含 "thinking" 的模型 (如 kimi-k2-thinking, gemini-2.0-flash-thinking)
         # configureRequest:e=>{e.thinking_mode=!0}
-        elif "thinking" in model_lower:
+        elif "thinking" in model_lower and thinking_enabled is True:
             if "thinking_mode" not in body:
                 body["thinking_mode"] = True
             logger.debug("为模型 %s 添加思考参数: thinking_mode", model)
-        
+
         # 7. mimo- 模型
         # configureRequest:e=>{e.thinking={type:"enabled"}}
-        elif model_lower.startswith("mimo-"):
+        elif model_lower.startswith("mimo-") and thinking_enabled is True:
             if "thinking" not in body:
                 body["thinking"] = {"type": "enabled"}
             logger.debug("为模型 %s 添加思考参数: thinking", model)
-        
+
         # 8. Claude 模型
         # configureRequest:e=>{e.chat_template_kwargs={enable_thinking:!0}}
-        elif "claude" in model_lower:
+        elif "claude" in model_lower and thinking_enabled is True:
             if "chat_template_kwargs" not in body:
                 body["chat_template_kwargs"] = {"enable_thinking": True}
             logger.debug("为模型 %s 添加思考参数: chat_template_kwargs", model)
-        
+
         # 9. sonnet- 模型
         # configureRequest:e=>{e.chat_template_kwargs={enable_thinking:!0}}
-        elif "sonnet-" in model_lower:
+        elif "sonnet-" in model_lower and thinking_enabled is True:
             if "chat_template_kwargs" not in body:
                 body["chat_template_kwargs"] = {"enable_thinking": True}
             logger.debug("为模型 %s 添加思考参数: chat_template_kwargs", model)
-        
+
         # 10. 包含 "reasoning" 的模型
         # configureRequest:e=>{e.reasoning=!0}
-        elif "reasoning" in model_lower:
+        elif "reasoning" in model_lower and thinking_enabled is True:
             if "reasoning" not in body:
                 body["reasoning"] = True
             logger.debug("为模型 %s 添加思考参数: reasoning", model)
-        
+
         # 11. Qwen 4B 模型 (不支持思考，需要删除相关参数)
         # configureRequest:e=>{delete e.thinking_mode,delete e.reasoning,delete e.chat_template_kwargs}
         if re.match(r'qwen.*4b', model_lower, re.IGNORECASE):
             for key in ["thinking_mode", "reasoning", "chat_template_kwargs"]:
                 if key in body:
                     del body[key]
+            if thinking_enabled is True:
+                body.setdefault("extend_fields", {})
+                body["extend_fields"]["chat_template_kwargs"] = {"enable_thinking": False}
             logger.debug("为模型 %s 移除思考参数 (不支持)", model)
-        
+
         return body
 
     async def close(self):
@@ -719,11 +798,16 @@ class IFlowProxy:
         # 来源: iFlow CLI 源码中的模型配置
         # GLM-5 等思考模型需要 enable_thinking 参数才能正常工作
         model = request_body.get("model", "")
+        if "max_new_tokens" not in request_body:
+            request_body["max_new_tokens"] = self._resolve_official_max_new_tokens(
+                model,
+                request_body.get("max_tokens"),
+            )
         request_body = self._configure_model_request(request_body, model)
 
         # 统一 trace 链路：同一轮 run_started/chat/run_error 复用同一个 trace_id
-        traceparent = self._generate_traceparent()
-        trace_id = self._extract_trace_id(traceparent)
+        traceparent = None
+        trace_id = self._generate_trace_id()
         parent_observation_id = ""
         try:
             parent_observation_id = await self._emit_run_started(model, trace_id)
