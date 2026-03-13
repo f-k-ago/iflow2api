@@ -1,23 +1,10 @@
 import process from "node:process";
 import { Buffer } from "node:buffer";
 import { once } from "node:events";
+import readline from "node:readline";
+import { Agent, fetch, ProxyAgent, setGlobalDispatcher } from "undici";
 
-const META_PREFIX = "__IFLOW_NODE_META__=";
-const ERROR_PREFIX = "__IFLOW_NODE_ERROR__=";
-
-function writeMeta(payload) {
-  process.stderr.write(`${META_PREFIX}${JSON.stringify(payload)}\n`);
-}
-
-function writeError(error) {
-  const payload = {
-    name: error?.name || "Error",
-    message: error?.message || String(error),
-    code: error?.code || null,
-    stack: error?.stack || null,
-  };
-  process.stderr.write(`${ERROR_PREFIX}${JSON.stringify(payload)}\n`);
-}
+let dispatcherKey = null;
 
 function appendParams(rawUrl, params) {
   const url = new URL(rawUrl);
@@ -52,47 +39,29 @@ function buildBody(spec) {
   return undefined;
 }
 
-async function readStdin() {
-  const chunks = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks).toString("utf-8");
-}
-
-async function writeChunk(chunk) {
-  if (!chunk || chunk.length === 0) {
-    return;
-  }
-  if (!process.stdout.write(chunk)) {
+async function writeEvent(event) {
+  const line = `${JSON.stringify(event)}\n`;
+  if (!process.stdout.write(line)) {
     await once(process.stdout, "drain");
   }
 }
 
-async function pipeResponseBody(response, stream) {
-  if (!response.body) {
+async function ensureDispatcher(proxy) {
+  const normalizedProxy = typeof proxy === "string" ? proxy.trim() : "";
+  if (dispatcherKey === normalizedProxy) {
     return;
   }
-  if (!stream) {
-    const buffer = Buffer.from(await response.arrayBuffer());
-    await writeChunk(buffer);
-    return;
-  }
-  const reader = response.body.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-    await writeChunk(Buffer.from(value));
-  }
+  setGlobalDispatcher(normalizedProxy ? new ProxyAgent(normalizedProxy) : new Agent());
+  dispatcherKey = normalizedProxy;
 }
 
-async function main() {
+async function handleRequest(spec) {
+  const requestId = typeof spec.request_id === "string" ? spec.request_id : "";
+  const timeoutMs = Number(spec.timeout_ms || 300000);
+
   try {
-    const raw = await readStdin();
-    const spec = raw ? JSON.parse(raw) : {};
-    const timeoutMs = Number(spec.timeout_ms || 300000);
+    await ensureDispatcher(spec.proxy);
+
     const controller = new AbortController();
     const timer = Number.isFinite(timeoutMs) && timeoutMs > 0
       ? setTimeout(() => controller.abort(new Error(`Request timed out after ${timeoutMs}ms`)), timeoutMs)
@@ -107,20 +76,79 @@ async function main() {
         redirect: spec.follow_redirects === false ? "manual" : "follow",
       });
 
-      writeMeta({
+      await writeEvent({
+        request_id: requestId,
+        type: "meta",
         status_code: response.status,
         headers: Object.fromEntries(response.headers.entries()),
       });
-      await pipeResponseBody(response, Boolean(spec.stream));
+
+      if (response.body) {
+        if (spec.stream) {
+          const reader = response.body.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              break;
+            }
+            await writeEvent({
+              request_id: requestId,
+              type: "chunk",
+              data_base64: Buffer.from(value).toString("base64"),
+            });
+          }
+        } else {
+          const buffer = Buffer.from(await response.arrayBuffer());
+          if (buffer.length > 0) {
+            await writeEvent({
+              request_id: requestId,
+              type: "chunk",
+              data_base64: buffer.toString("base64"),
+            });
+          }
+        }
+      }
+
+      await writeEvent({
+        request_id: requestId,
+        type: "end",
+      });
     } finally {
       if (timer) {
         clearTimeout(timer);
       }
     }
   } catch (error) {
-    writeError(error);
-    process.exitCode = 1;
+    await writeEvent({
+      request_id: requestId,
+      type: "error",
+      name: error?.name || "Error",
+      message: error?.message || String(error),
+      code: error?.code || null,
+    });
   }
 }
 
-await main();
+const rl = readline.createInterface({
+  input: process.stdin,
+  crlfDelay: Infinity,
+});
+
+for await (const line of rl) {
+  const text = line.trim();
+  if (!text) {
+    continue;
+  }
+  try {
+    const spec = JSON.parse(text);
+    await handleRequest(spec);
+  } catch (error) {
+    await writeEvent({
+      request_id: "",
+      type: "error",
+      name: error?.name || "Error",
+      message: error?.message || String(error),
+      code: error?.code || null,
+    });
+  }
+}

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Optional
@@ -20,8 +21,6 @@ logger = logging.getLogger("iflow2api")
 TransportBackend = Literal["httpx", "curl_cffi", "node_fetch"]
 
 
-_NODE_BRIDGE_META_PREFIX = "__IFLOW_NODE_META__="
-_NODE_BRIDGE_ERROR_PREFIX = "__IFLOW_NODE_ERROR__="
 _NODE_BRIDGE_SCRIPT = Path(__file__).with_name("node_fetch_bridge.mjs")
 _PROXY_ENV_KEYS = (
     "NODE_USE_ENV_PROXY",
@@ -85,17 +84,19 @@ class _StreamingNodeFetchRawResponse:
     def __init__(
         self,
         *,
-        process: asyncio.subprocess.Process,
+        transport: "NodeFetchTransport",
+        request_id: str,
         status_code: int,
         headers: dict[str, str],
-        stderr_task: "asyncio.Task[str]",
     ):
-        self._process = process
+        self._transport = transport
+        self._request_id = request_id
         self.status_code = status_code
         self.headers = headers
-        self._stderr_task = stderr_task
         self._cached_content: bytes | None = None
         self._stream_consumed = False
+        self._ended = False
+        self._released = False
 
     @property
     def text(self) -> str:
@@ -120,15 +121,10 @@ class _StreamingNodeFetchRawResponse:
         if self._cached_content is not None:
             return self._cached_content
 
-        stdout = self._process.stdout
-        if stdout is None:
-            self._cached_content = b""
-            return self._cached_content
-
-        content = await stdout.read()
-        await self._wait_for_exit()
-        self._cached_content = bytes(content)
-        self._stream_consumed = True
+        chunks = []
+        async for chunk in self.aiter_bytes():
+            chunks.append(chunk)
+        self._cached_content = b"".join(chunks)
         return self._cached_content
 
     async def aiter_bytes(self) -> AsyncIterator[bytes]:
@@ -140,35 +136,36 @@ class _StreamingNodeFetchRawResponse:
         if self._stream_consumed:
             return
 
-        stdout = self._process.stdout
-        if stdout is None:
-            self._cached_content = b""
-            self._stream_consumed = True
-            return
-
         chunks: list[bytes] = []
         try:
             while True:
-                chunk = await stdout.read(65536)
-                if not chunk:
+                event = await self._transport._read_bridge_event(self._request_id)
+                event_type = event.get("type")
+                if event_type == "chunk":
+                    chunk = base64.b64decode(event.get("data_base64") or "")
+                    chunks.append(chunk)
+                    yield chunk
+                    continue
+                if event_type == "end":
+                    self._ended = True
                     break
-                chunks.append(chunk)
-                yield chunk
+                if event_type == "error":
+                    raise NodeFetchBridgeError(str(event.get("message") or "Node fetch bridge 请求失败"))
+                raise NodeFetchBridgeError(f"Node fetch bridge 返回了未知事件: {event_type!r}")
         finally:
             self._cached_content = b"".join(chunks)
             self._stream_consumed = True
-            await self._wait_for_exit()
+            await self.aclose()
 
-    async def _wait_for_exit(self) -> None:
-        return_code = await self._process.wait()
-        stderr_text = await self._stderr_task
-        if return_code == 0:
+    async def aclose(self) -> None:
+        if self._released:
             return
-        details = stderr_text.strip()
-        raise NodeFetchBridgeError(
-            f"Node fetch bridge 进程异常退出 (code={return_code})"
-            + (f": {details}" if details else "")
-        )
+        self._released = True
+
+        if not self._ended:
+            await self._transport._reset_worker()
+
+        self._transport._release_request_lock()
 
 
 def _node_bridge_payload(
@@ -182,8 +179,10 @@ def _node_bridge_payload(
     timeout: Optional[float],
     stream: bool,
     follow_redirects: bool,
+    proxy: Optional[str],
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
+        "request_id": uuid.uuid4().hex,
         "method": method,
         "url": url,
         "headers": headers or {},
@@ -191,6 +190,7 @@ def _node_bridge_payload(
         "timeout_ms": int((timeout or 300.0) * 1000),
         "stream": stream,
         "follow_redirects": follow_redirects,
+        "proxy": proxy or "",
     }
     if json_body is not None:
         payload["json_body"] = json_body
@@ -206,50 +206,7 @@ def _node_bridge_env(proxy: Optional[str]) -> dict[str, str]:
     env = os.environ.copy()
     for key in _PROXY_ENV_KEYS:
         env.pop(key, None)
-    if proxy:
-        env["NODE_USE_ENV_PROXY"] = "1"
-        env["HTTP_PROXY"] = proxy
-        env["HTTPS_PROXY"] = proxy
-        env["ALL_PROXY"] = proxy
-        env["http_proxy"] = proxy
-        env["https_proxy"] = proxy
-        env["all_proxy"] = proxy
     return env
-
-
-def _parse_node_bridge_meta(stderr_text: str) -> tuple[int, dict[str, str]]:
-    for line in stderr_text.splitlines():
-        line = line.strip()
-        if not line.startswith(_NODE_BRIDGE_META_PREFIX):
-            continue
-        payload = json.loads(line[len(_NODE_BRIDGE_META_PREFIX):])
-        status_code = int(payload.get("status_code", 0))
-        headers = payload.get("headers")
-        return status_code, headers if isinstance(headers, dict) else {}
-    raise NodeFetchBridgeError(
-        "Node fetch bridge 未返回响应元数据"
-        + (f": {stderr_text.strip()}" if stderr_text.strip() else "")
-    )
-
-
-def _parse_node_bridge_error(stderr_text: str) -> str:
-    for line in stderr_text.splitlines():
-        line = line.strip()
-        if not line.startswith(_NODE_BRIDGE_ERROR_PREFIX):
-            continue
-        payload = json.loads(line[len(_NODE_BRIDGE_ERROR_PREFIX):])
-        message = str(payload.get("message") or "").strip()
-        if message:
-            return message
-        return json.dumps(payload, ensure_ascii=False)
-    return stderr_text.strip()
-
-
-async def _drain_stream_text(stream: asyncio.StreamReader | None) -> str:
-    if stream is None:
-        return ""
-    data = await stream.read()
-    return data.decode("utf-8", errors="replace")
 
 
 class UpstreamResponse:
@@ -585,7 +542,7 @@ class CurlCffiTransport(BaseUpstreamTransport):
 
 
 class NodeFetchTransport(BaseUpstreamTransport):
-    """Node fetch 桥接实现。"""
+    """Node fetch 长驻 worker 桥接实现。"""
 
     def __init__(
         self,
@@ -602,6 +559,110 @@ class NodeFetchTransport(BaseUpstreamTransport):
             raise RuntimeError("未找到 node 可执行文件，无法启用 node_fetch 传输层")
         if not _NODE_BRIDGE_SCRIPT.exists():
             raise RuntimeError(f"Node fetch bridge 脚本不存在: {_NODE_BRIDGE_SCRIPT}")
+        self._worker: asyncio.subprocess.Process | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._request_lock = asyncio.Lock()
+
+    async def _ensure_worker(self) -> asyncio.subprocess.Process:
+        process = self._worker
+        if process is not None and process.returncode is None:
+            return process
+
+        process = await asyncio.create_subprocess_exec(
+            self._node_path,
+            str(_NODE_BRIDGE_SCRIPT),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_node_bridge_env(self._proxy),
+        )
+        self._worker = process
+        self._stderr_task = asyncio.create_task(self._drain_worker_stderr(process))
+        return process
+
+    async def _drain_worker_stderr(self, process: asyncio.subprocess.Process) -> None:
+        stream = process.stderr
+        if stream is None:
+            return
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").rstrip()
+            if text:
+                logger.debug("node_fetch worker stderr[%s]: %s", process.pid, text)
+
+    async def _reset_worker(self) -> None:
+        process = self._worker
+        self._worker = None
+        stderr_task = self._stderr_task
+        self._stderr_task = None
+
+        if process is not None and process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+
+        if stderr_task is not None:
+            try:
+                await stderr_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _send_bridge_request(self, payload: dict[str, Any]) -> None:
+        process = await self._ensure_worker()
+        stdin = process.stdin
+        if stdin is None:
+            await self._reset_worker()
+            raise NodeFetchBridgeError("Node fetch worker stdin 不可用")
+
+        stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+        await stdin.drain()
+
+    async def _read_bridge_event(self, request_id: str) -> dict[str, Any]:
+        process = await self._ensure_worker()
+        stdout = process.stdout
+        if stdout is None:
+            await self._reset_worker()
+            raise NodeFetchBridgeError("Node fetch worker stdout 不可用")
+
+        while True:
+            line = await stdout.readline()
+            if not line:
+                return_code = await process.wait()
+                await self._reset_worker()
+                raise NodeFetchBridgeError(
+                    f"Node fetch worker 意外退出，未返回完整响应 (code={return_code})"
+                )
+
+            try:
+                event = json.loads(line.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                await self._reset_worker()
+                raise NodeFetchBridgeError("Node fetch worker 返回了非法 JSON 事件") from exc
+
+            if event.get("request_id") != request_id:
+                await self._reset_worker()
+                raise NodeFetchBridgeError("Node fetch worker 请求序列错乱，request_id 不匹配")
+            return event
+
+    async def _await_meta(self, request_id: str) -> tuple[int, dict[str, str]]:
+        event = await self._read_bridge_event(request_id)
+        event_type = event.get("type")
+        if event_type == "meta":
+            status_code = int(event.get("status_code") or 0)
+            headers = event.get("headers")
+            return status_code, headers if isinstance(headers, dict) else {}
+        if event_type == "error":
+            raise NodeFetchBridgeError(str(event.get("message") or "Node fetch bridge 请求失败"))
+        raise NodeFetchBridgeError(f"Node fetch worker 返回了未知握手事件: {event_type!r}")
+
+    def _release_request_lock(self) -> None:
+        if self._request_lock.locked():
+            self._request_lock.release()
 
     async def request(
         self,
@@ -624,32 +685,35 @@ class NodeFetchTransport(BaseUpstreamTransport):
             timeout=timeout or self._timeout,
             stream=False,
             follow_redirects=self._follow_redirects,
+            proxy=self._proxy,
         )
-        process = await asyncio.create_subprocess_exec(
-            self._node_path,
-            str(_NODE_BRIDGE_SCRIPT),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_node_bridge_env(self._proxy),
-        )
-        stdout, stderr = await process.communicate(
-            json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        )
-        stderr_text = stderr.decode("utf-8", errors="replace")
+        request_id = str(payload["request_id"])
 
-        if process.returncode != 0:
-            raise NodeFetchBridgeError(
-                "Node fetch bridge 请求失败"
-                + (f": {_parse_node_bridge_error(stderr_text)}" if stderr_text.strip() else "")
-            )
+        await self._request_lock.acquire()
+        try:
+            await self._send_bridge_request(payload)
+            status_code, response_headers = await self._await_meta(request_id)
 
-        status_code, response_headers = _parse_node_bridge_meta(stderr_text)
+            chunks: list[bytes] = []
+            while True:
+                event = await self._read_bridge_event(request_id)
+                event_type = event.get("type")
+                if event_type == "chunk":
+                    chunks.append(base64.b64decode(event.get("data_base64") or ""))
+                    continue
+                if event_type == "end":
+                    break
+                if event_type == "error":
+                    raise NodeFetchBridgeError(str(event.get("message") or "Node fetch bridge 请求失败"))
+                raise NodeFetchBridgeError(f"Node fetch worker 返回了未知事件: {event_type!r}")
+        finally:
+            self._release_request_lock()
+
         return UpstreamResponse(
             _BufferedNodeFetchRawResponse(
                 status_code=status_code,
                 headers=response_headers,
-                content=stdout,
+                content=b"".join(chunks),
             )
         )
 
@@ -675,83 +739,33 @@ class NodeFetchTransport(BaseUpstreamTransport):
             timeout=timeout or self._timeout,
             stream=True,
             follow_redirects=self._follow_redirects,
+            proxy=self._proxy,
         )
-        process = await asyncio.create_subprocess_exec(
-            self._node_path,
-            str(_NODE_BRIDGE_SCRIPT),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_node_bridge_env(self._proxy),
-        )
+        request_id = str(payload["request_id"])
 
-        stdin = process.stdin
-        if stdin is None:
-            process.kill()
-            await process.wait()
-            raise NodeFetchBridgeError("Node fetch bridge stdin 不可用")
-        stdin.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-        await stdin.drain()
-        stdin.close()
-
-        stderr = process.stderr
-        if stderr is None:
-            process.kill()
-            await process.wait()
-            raise NodeFetchBridgeError("Node fetch bridge stderr 不可用")
-
-        handshake_lines: list[str] = []
-        while True:
-            line = await stderr.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", errors="replace").rstrip("\n")
-            handshake_lines.append(text)
-            if text.startswith(_NODE_BRIDGE_META_PREFIX):
-                break
-            if text.startswith(_NODE_BRIDGE_ERROR_PREFIX):
-                break
-
-        stderr_text = "\n".join(handshake_lines).strip()
-        if not stderr_text:
-            process.kill()
-            await process.wait()
-            raise NodeFetchBridgeError("Node fetch bridge 未返回握手元数据")
-
-        if any(line.startswith(_NODE_BRIDGE_ERROR_PREFIX) for line in handshake_lines):
-            process.kill()
-            await process.wait()
-            raise NodeFetchBridgeError(_parse_node_bridge_error(stderr_text))
-
-        status_code, response_headers = _parse_node_bridge_meta(stderr_text)
-        stderr_task = asyncio.create_task(_drain_stream_text(stderr))
+        await self._request_lock.acquire()
+        response: UpstreamResponse | None = None
 
         try:
-            yield UpstreamResponse(
+            await self._send_bridge_request(payload)
+            status_code, response_headers = await self._await_meta(request_id)
+            response = UpstreamResponse(
                 _StreamingNodeFetchRawResponse(
-                    process=process,
+                    transport=self,
+                    request_id=request_id,
                     status_code=status_code,
                     headers=response_headers,
-                    stderr_task=stderr_task,
                 )
             )
+            yield response
         finally:
-            if process.returncode is None:
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
-            if not stderr_task.done():
-                stderr_task.cancel()
-                try:
-                    await stderr_task
-                except asyncio.CancelledError:
-                    pass
+            if response is not None:
+                await response.raw.aclose()
+            else:
+                self._release_request_lock()
 
     async def close(self) -> None:
-        return None
+        await self._reset_worker()
 
 
 def create_upstream_transport(

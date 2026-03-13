@@ -25,11 +25,19 @@ ENV PATH="/opt/venv/bin:$PATH"
 # 使用 uv sync 从 lock 文件安装依赖，--active 使用已存在的虚拟环境
 RUN uv sync --frozen --no-dev --active
 
+# 阶段1b: Node bridge 依赖
+FROM node:24.14.0-slim AS node-deps
+WORKDIR /node-bridge
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
 # 阶段2: 运行阶段
 FROM python:3.12-slim
 
 # 从官方 Node 运行时复制 node 二进制，供 upstream node_fetch bridge 使用
 COPY --from=node:24.14.0-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-deps /node-bridge/node_modules /app/node_modules
+COPY --from=node-deps /node-bridge/package.json /app/package.json
 
 # 安装运行时依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \

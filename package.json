@@ -1,0 +1,11 @@
+{
+  "name": "iflow2api-node-bridge",
+  "version": "1.6.10",
+  "private": true,
+  "description": "Node fetch bridge for iflow2api upstream parity",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "undici": "7.24.0"
+  }
+}

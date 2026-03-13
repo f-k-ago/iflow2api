@@ -25,6 +25,7 @@ wheels/
 .venv/
 venv/
 ENV/
+node_modules/
 
 # IDE
 .idea/
