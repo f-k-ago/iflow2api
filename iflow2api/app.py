@@ -565,7 +565,21 @@ def _extract_upstream_error(exc: Exception) -> tuple[int, str]:
             error_msg = error_data.get("msg", error_msg)
         except Exception:
             pass
-    return status_code, error_msg
+    return _normalize_error_status_code(status_code), error_msg
+
+
+def _normalize_error_status_code(status_code: object) -> int:
+    """将上游错误状态码规范为合法 HTTP 错误码。"""
+    try:
+        normalized = int(status_code)
+    except (TypeError, ValueError):
+        normalized = 502
+
+    if 400 <= normalized <= 599:
+        return normalized
+
+    logger.warning("检测到非法上游状态码 %r，已回退为 502", status_code)
+    return 502
 
 
 def _map_upstream_exception(exc: Exception) -> JSONResponse:
@@ -1028,14 +1042,15 @@ async def list_vision_models():
 
 def create_error_response(status_code: int, message: str, error_type: str = "api_error") -> JSONResponse:
     """创建 OpenAI 兼容的错误响应"""
+    normalized_status_code = _normalize_error_status_code(status_code)
     return JSONResponse(
-        status_code=status_code,
+        status_code=normalized_status_code,
         content={
             "error": {
                 "message": message,
                 "type": error_type,
                 "param": None,
-                "code": str(status_code)
+                "code": str(normalized_status_code)
             }
         }
     )
