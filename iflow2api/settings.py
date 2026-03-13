@@ -398,6 +398,8 @@ def load_settings() -> AppSettings:
                     settings.host = data["host"]
                 if "port" in data:
                     settings.port = data["port"]
+                if "oauth_callback_base_url" in data:
+                    settings.oauth_callback_base_url = data["oauth_callback_base_url"]
                 # api_key 和 base_url 也保存在 iflow2api/config.json 中
                 if "api_key" in data:
                     settings.api_key = data["api_key"]
@@ -521,6 +523,7 @@ def save_settings(settings: AppSettings) -> None:
     app_data = {
         "host": settings.host,
         "port": settings.port,
+        "oauth_callback_base_url": settings.oauth_callback_base_url,
         # iFlow 配置也保存到 iflow2api/config.json
         "api_key": settings.api_key,
         "base_url": settings.base_url,

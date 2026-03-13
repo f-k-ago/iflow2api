@@ -204,24 +204,18 @@
                         </div>
                         <div class="card-body">
                             <form id="iflow-settings-form">
-                                <div class="form-group">
-                                    <label for="setting-account-label">账号备注</label>
-                                    <input type="text" id="setting-account-label" name="account_label" placeholder="可选，留空会自动生成">
-                                </div>
-                                <div class="form-group">
-                                    <label for="setting-api-key">API Key</label>
-                                    <input type="password" id="setting-api-key" name="api_key" placeholder="用于新增 API Key 账号">
-                                </div>
-                                <div class="form-group">
-                                    <label for="setting-base-url">Base URL</label>
-                                    <input type="text" id="setting-base-url" name="base_url" placeholder="https://apis.iflow.cn/v1">
-                                </div>
                                 <div class="form-row">
-                                    <button type="button" id="add-api-account-btn" class="btn btn-primary">添加 API Key 账号</button>
-                                    <button type="button" id="oauth-login-btn" class="btn btn-secondary">OAuth 登录</button>
+                                    <button type="button" id="oauth-login-btn" class="btn btn-primary">OAuth 登录</button>
                                     <button type="button" id="cookie-login-btn" class="btn btn-secondary">Cookie 登录</button>
                                 </div>
-                                <p class="hint">这里的 API Key 表单只用于新增账号，不会在“保存设置”时覆盖现有账号。OAuth 和 Cookie 登录也会直接写入账号池。</p>
+                                <div class="form-group" style="margin-top: 16px;">
+                                    <label for="oauth-callback-url">OAuth 回调链接</label>
+                                    <input type="text" id="oauth-callback-url" name="oauth_callback_url" placeholder="如果自动回调失败，请粘贴浏览器地址栏里的完整回调链接">
+                                </div>
+                                <div class="form-row">
+                                    <button type="button" id="oauth-callback-submit-btn" class="btn btn-secondary">提交回调链接</button>
+                                </div>
+                                <p class="hint">参考 cpa 的手动回调方式：若部署在局域网或外网环境、浏览器无法自动回到当前管理页，请完成 OAuth 登录后，把最终回调地址完整粘贴到这里再提交。</p>
                                 <div class="form-group" style="margin-top: 20px;">
                                     <label>已配置账号</label>
                                     <table class="info-table" id="upstream-accounts-table">
@@ -256,6 +250,11 @@
                                     <label for="setting-port">端口</label>
                                     <input type="number" id="setting-port" name="port" min="1" max="65535">
                                 </div>
+                                <div class="form-group">
+                                    <label for="setting-oauth-callback-base-url">OAuth 回调基地址</label>
+                                    <input type="text" id="setting-oauth-callback-base-url" name="oauth_callback_base_url" placeholder="可选，如 https://your-domain.com 或 http://192.168.1.10:28000">
+                                </div>
+                                <p class="hint">留空时默认使用 <code>http://localhost:端口/admin/oauth/callback</code>；如果部署在局域网或外网，建议填写当前管理页可访问的基地址。</p>
                             </form>
                         </div>
                     </div>

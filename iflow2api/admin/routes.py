@@ -1,10 +1,12 @@
 """Web 管理界面路由"""
 import platform
+import secrets
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -44,12 +46,11 @@ class SettingsUpdate(BaseModel):
     """设置更新请求"""
     host: Optional[str] = None
     port: Optional[int] = None
+    oauth_callback_base_url: Optional[str] = None
     theme_mode: Optional[str] = None
     preserve_reasoning_content: Optional[bool] = None
     api_concurrency: Optional[int] = None
     language: Optional[str] = None
-    api_key: Optional[str] = None
-    base_url: Optional[str] = None
     custom_api_key: Optional[str] = None
     custom_auth_header: Optional[str] = None
     # 上游代理设置
@@ -60,21 +61,14 @@ class SettingsUpdate(BaseModel):
 
 class OAuthCallbackRequest(BaseModel):
     """OAuth 回调请求"""
-    code: str
+    code: Optional[str] = None
     state: Optional[str] = None
+    redirect_url: Optional[str] = None
 
 
 class CookieLoginRequest(BaseModel):
     """Cookie 登录请求"""
     cookie: str
-
-
-class UpstreamAccountCreateRequest(BaseModel):
-    """新增上游账号请求。"""
-
-    label: Optional[str] = None
-    api_key: str
-    base_url: Optional[str] = None
 
 
 class UpstreamAccountToggleRequest(BaseModel):
@@ -313,6 +307,38 @@ def _serialize_upstream_account(account) -> dict[str, Any]:
     }
 
 
+def _extract_oauth_callback_payload(callback_url: str) -> tuple[str, Optional[str]]:
+    """从完整回调链接中提取 code/state。"""
+    parsed = urlparse(callback_url.strip())
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    fragment = parse_qs(parsed.fragment, keep_blank_values=True)
+
+    code = (
+        (query.get("code") or [None])[0]
+        or (fragment.get("code") or [None])[0]
+        or ""
+    )
+    state = (
+        (query.get("state") or [None])[0]
+        or (fragment.get("state") or [None])[0]
+    )
+
+    if not str(code).strip():
+        raise HTTPException(status_code=400, detail="回调链接中缺少 code 参数")
+
+    return str(code).strip(), str(state).strip() if isinstance(state, str) and state.strip() else None
+
+
+def _build_oauth_redirect_uri(request: Request, callback_base_url: str) -> str:
+    """构建 OAuth redirect_uri。"""
+    base = (callback_base_url or "").strip()
+    if base:
+        return f"{base.rstrip('/')}/admin/oauth/callback"
+
+    request_base = str(request.base_url).rstrip("/")
+    return f"{request_base}/admin/oauth/callback"
+
+
 def _materialize_legacy_account(settings) -> None:
     """必要时把旧单账号字段转成账号池条目。"""
     from ..settings import build_legacy_account
@@ -379,12 +405,11 @@ async def get_settings(username: str = Depends(get_current_user)) -> dict[str, A
     return {
         "host": settings.host,
         "port": settings.port,
+        "oauth_callback_base_url": settings.oauth_callback_base_url,
         "theme_mode": settings.theme_mode,
         "preserve_reasoning_content": settings.preserve_reasoning_content,
         "api_concurrency": settings.api_concurrency,
         "language": settings.language,
-        "api_key": settings.api_key,
-        "base_url": settings.base_url,
         "custom_api_key": settings.custom_api_key,
         "custom_auth_header": settings.custom_auth_header,
         # 上游代理设置
@@ -401,8 +426,8 @@ async def update_settings(
     username: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """更新应用设置"""
-    from ..settings import get_primary_account, load_settings, save_settings, upsert_upstream_account
-    
+    from ..settings import load_settings, save_settings
+
     settings = load_settings()
     
     # 更新设置
@@ -410,6 +435,8 @@ async def update_settings(
         settings.host = request.host
     if request.port is not None:
         settings.port = request.port
+    if request.oauth_callback_base_url is not None:
+        settings.oauth_callback_base_url = request.oauth_callback_base_url.strip()
     if request.theme_mode is not None:
         settings.theme_mode = request.theme_mode
     if request.preserve_reasoning_content is not None:
@@ -418,22 +445,6 @@ async def update_settings(
         settings.api_concurrency = request.api_concurrency
     if request.language is not None:
         settings.language = request.language
-    if request.api_key is not None:
-        if settings.upstream_accounts:
-                primary_account = get_primary_account(settings, include_disabled=True)
-                if primary_account and request.api_key.strip():
-                    primary_account.api_key = request.api_key.strip()
-                    upsert_upstream_account(settings, primary_account)
-        else:
-            settings.api_key = request.api_key
-    if request.base_url is not None:
-        if settings.upstream_accounts:
-                primary_account = get_primary_account(settings, include_disabled=True)
-                if primary_account and request.base_url.strip():
-                    primary_account.base_url = request.base_url.strip()
-                    upsert_upstream_account(settings, primary_account)
-        else:
-            settings.base_url = request.base_url
     if request.custom_api_key is not None:
         settings.custom_api_key = request.custom_api_key
     if request.custom_auth_header is not None:
@@ -476,34 +487,6 @@ async def get_upstream_accounts(username: str = Depends(get_current_user)) -> di
             _serialize_upstream_account(account)
             for account in accounts
         ],
-    }
-
-
-@admin_router.post("/upstream-accounts")
-async def create_upstream_account(
-    request: UpstreamAccountCreateRequest,
-    username: str = Depends(get_current_user),
-) -> dict[str, Any]:
-    """手动新增 API Key 账号。"""
-    from ..settings import DEFAULT_BASE_URL, UpstreamAccount, load_settings, save_settings, upsert_upstream_account
-
-    settings = load_settings()
-    account = UpstreamAccount(
-        label=(request.label or "").strip() or "",
-        auth_type="api-key",
-        api_key=request.api_key.strip(),
-        base_url=(request.base_url or settings.base_url or DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL,
-    )
-    saved_account = upsert_upstream_account(settings, account)
-    save_settings(settings)
-
-    from ..app import reload_proxy
-
-    reload_proxy()
-    return {
-        "success": True,
-        "message": "账号已添加到账号池",
-        "account": _serialize_upstream_account(saved_account),
     }
 
 
@@ -631,22 +614,16 @@ async def get_oauth_url(
 
     settings = load_settings()
     oauth = IFlowOAuth()
+    redirect_uri = _build_oauth_redirect_uri(request, settings.oauth_callback_base_url)
 
-    # 构建回调地址
-    if settings.oauth_callback_base_url:
-        # 使用配置的公网地址
-        redirect_uri = f"{settings.oauth_callback_base_url.rstrip('/')}/admin/oauth/callback"
-    else:
-        # 使用 localhost（默认行为）
-        port = request.url.port or 28000
-        redirect_uri = f"http://localhost:{port}/admin/oauth/callback"
-
-    auth_url = oauth.get_auth_url(redirect_uri=redirect_uri)
+    state = secrets.token_urlsafe(16)
+    auth_url = oauth.get_auth_url(redirect_uri=redirect_uri, state=state)
 
     return {
         "success": True,
         "auth_url": auth_url,
         "redirect_uri": redirect_uri,
+        "state": state,
     }
 
 
@@ -802,17 +779,21 @@ async def oauth_callback(
 
     settings = load_settings()
     oauth = IFlowOAuth()
+    callback_code = (callback_request.code or "").strip()
+    callback_state = (callback_request.state or "").strip() or None
+
+    if callback_request.redirect_url:
+        callback_code, callback_state = _extract_oauth_callback_payload(callback_request.redirect_url)
+
+    if not callback_code:
+        raise HTTPException(status_code=400, detail="OAuth 回调缺少授权码")
 
     # 构建回调地址（必须与获取 auth_url 时一致）
-    if settings.oauth_callback_base_url:
-        redirect_uri = f"{settings.oauth_callback_base_url.rstrip('/')}/admin/oauth/callback"
-    else:
-        port = fastapi_request.url.port or 28000
-        redirect_uri = f"http://localhost:{port}/admin/oauth/callback"
+    redirect_uri = _build_oauth_redirect_uri(fastapi_request, settings.oauth_callback_base_url)
     
     try:
         # 使用授权码获取 token
-        token_data = await oauth.get_token(callback_request.code, redirect_uri=redirect_uri)
+        token_data = await oauth.get_token(callback_code, redirect_uri=redirect_uri)
         access_token = token_data.get("access_token")
         
         if not access_token:
@@ -849,6 +830,7 @@ async def oauth_callback(
             "message": "登录成功！配置已自动更新",
             "api_key": api_key,
             "account_id": saved_account.id,
+            "state": callback_state,
         }
         
     except Exception as e:

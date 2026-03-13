@@ -4,6 +4,7 @@ import base64
 import secrets
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
+from urllib.parse import urlencode
 
 from .transport import BaseUpstreamTransport, create_upstream_transport
 
@@ -244,14 +245,16 @@ class IFlowOAuth:
         if state is None:
             state = secrets.token_urlsafe(16)
 
-        return (
-            f"{self.AUTH_URL}?"
-            f"client_id={self.CLIENT_ID}&"
-            f"loginMethod=phone&"
-            f"type=phone&"
-            f"redirect={redirect_uri}&"
-            f"state={state}"
+        query = urlencode(
+            {
+                "client_id": self.CLIENT_ID,
+                "loginMethod": "phone",
+                "type": "phone",
+                "redirect": redirect_uri,
+                "state": state,
+            }
         )
+        return f"{self.AUTH_URL}?{query}"
 
     async def validate_token(self, access_token: str) -> bool:
         """验证 access_token 是否有效"""

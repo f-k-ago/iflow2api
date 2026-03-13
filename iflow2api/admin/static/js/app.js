@@ -389,14 +389,10 @@ async function loadSettings() {
         const data = await apiRequest('/settings');
         state.settings = data;
 
-        // 账号池新增表单只保留默认 Base URL，不自动回填真实 API Key
-        document.getElementById('setting-account-label').value = '';
-        document.getElementById('setting-api-key').value = '';
-        document.getElementById('setting-base-url').value = data.base_url || '';
-        
         // 填充服务器配置
         document.getElementById('setting-host').value = data.host || '';
         document.getElementById('setting-port').value = data.port || 28000;
+        document.getElementById('setting-oauth-callback-base-url').value = data.oauth_callback_base_url || '';
 
         // 填充界面设置
         document.getElementById('setting-theme').value = data.theme_mode || 'system';
@@ -427,11 +423,10 @@ async function loadSettings() {
  */
 async function saveSettings() {
     const settings = {
-        // 当前主账号默认 Base URL
-        base_url: document.getElementById('setting-base-url').value,
         // 服务器配置
         host: document.getElementById('setting-host').value,
         port: parseInt(document.getElementById('setting-port').value),
+        oauth_callback_base_url: document.getElementById('setting-oauth-callback-base-url').value.trim(),
         // 界面设置
         theme_mode: document.getElementById('setting-theme').value,
         language: document.getElementById('setting-language').value,
@@ -454,34 +449,6 @@ async function saveSettings() {
             body: JSON.stringify(settings),
         });
         showToast('设置已保存', 'success');
-    } catch (error) {
-        showToast(error.message, 'error');
-    }
-}
-
-async function createApiKeyAccount() {
-    const label = document.getElementById('setting-account-label').value.trim();
-    const apiKey = document.getElementById('setting-api-key').value.trim();
-    const baseUrl = document.getElementById('setting-base-url').value.trim();
-
-    if (!apiKey) {
-        showToast('请输入 API Key', 'error');
-        return;
-    }
-
-    try {
-        await apiRequest('/upstream-accounts', {
-            method: 'POST',
-            body: JSON.stringify({
-                label,
-                api_key: apiKey,
-                base_url: baseUrl,
-            }),
-        });
-        showToast('账号已添加到账号池', 'success');
-        document.getElementById('setting-account-label').value = '';
-        document.getElementById('setting-api-key').value = '';
-        loadAccountInfo();
     } catch (error) {
         showToast(error.message, 'error');
     }
@@ -563,6 +530,7 @@ let _oauthMessageHandler = null;
 
 async function oauthLogin() {
     try {
+        document.getElementById('oauth-callback-url').value = '';
         // 获取 OAuth URL
         const data = await apiRequest('/oauth/url');
         const authUrl = data.auth_url;
@@ -578,6 +546,13 @@ async function oauthLogin() {
             'iFlow OAuth',
             `width=${width},height=${height},left=${left},top=${top},toolbar=no,menubar=no`
         );
+
+        if (!oauthWindow) {
+            showToast('浏览器拦截了 OAuth 登录窗口，请允许弹窗后重试', 'error');
+            return;
+        }
+
+        showToast('已打开 OAuth 登录页；若自动回调失败，请把最终回调链接粘贴到下方输入框后提交', 'success');
         
         // 移除之前的监听器（避免重复添加）
         if (_oauthMessageHandler) {
@@ -592,10 +567,9 @@ async function oauthLogin() {
                     try {
                         const result = await apiRequest('/oauth/callback', {
                             method: 'POST',
-                            body: JSON.stringify({ code }),
+                            body: JSON.stringify({ code, state: event.data.state || null }),
                         });
                         showToast(result.message, 'success');
-                        document.getElementById('setting-api-key').value = '';
                         loadSettings();
                         loadAccountInfo();
                     } catch (error) {
@@ -610,6 +584,29 @@ async function oauthLogin() {
         
         window.addEventListener('message', _oauthMessageHandler);
         
+    } catch (error) {
+        showToast(error.message, 'error');
+    }
+}
+
+async function submitOAuthCallbackUrl() {
+    const callbackUrlInput = document.getElementById('oauth-callback-url');
+    const callbackUrl = callbackUrlInput.value.trim();
+
+    if (!callbackUrl) {
+        showToast('请粘贴完整的 OAuth 回调链接', 'error');
+        return;
+    }
+
+    try {
+        const result = await apiRequest('/oauth/callback', {
+            method: 'POST',
+            body: JSON.stringify({ redirect_url: callbackUrl }),
+        });
+        showToast(result.message || 'OAuth 登录成功', 'success');
+        callbackUrlInput.value = '';
+        loadSettings();
+        loadAccountInfo();
     } catch (error) {
         showToast(error.message, 'error');
     }
@@ -848,8 +845,8 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('reset-settings-btn').addEventListener('click', loadSettings);
 
     // iFlow 配置按钮
-    document.getElementById('add-api-account-btn').addEventListener('click', createApiKeyAccount);
     document.getElementById('oauth-login-btn').addEventListener('click', oauthLogin);
+    document.getElementById('oauth-callback-submit-btn').addEventListener('click', submitOAuthCallbackUrl);
     document.getElementById('cookie-login-btn').addEventListener('click', openCookieModal);
     // Cookie 登录模态框
     document.getElementById('cookie-submit-btn').addEventListener('click', cookieLogin);
