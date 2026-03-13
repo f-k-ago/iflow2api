@@ -121,9 +121,6 @@ function renderUpstreamAccounts(accounts, tableId, includeActions = false) {
     accounts.forEach((account) => {
         const tr = document.createElement('tr');
         const statusText = account.enabled ? '启用' : '停用';
-        const detailText = [account.email, account.phone, account.cookie_expires_at]
-            .filter(Boolean)
-            .join(' / ');
         const labelText = escapeHtml(account.label);
 
         if (includeActions) {
@@ -132,11 +129,9 @@ function renderUpstreamAccounts(accounts, tableId, includeActions = false) {
                 <td>${escapeHtml(formatAuthType(account.auth_type))}</td>
                 <td>
                     <div class="table-primary-text">${escapeHtml(account.api_key_masked || '--')}</div>
-                    <div class="table-secondary-text">${escapeHtml(account.base_url || '') || '--'}</div>
                 </td>
                 <td>
                     <div class="table-primary-text">${escapeHtml(statusText)}</div>
-                    <div class="table-secondary-text">${escapeHtml(detailText || '--')}</div>
                 </td>
                 <td class="account-actions-cell">
                     <button type="button" class="btn btn-secondary btn-sm" onclick="testUpstreamAccount('${account.id}')" ${!account.enabled ? 'disabled' : ''}>测试</button>
@@ -150,11 +145,9 @@ function renderUpstreamAccounts(accounts, tableId, includeActions = false) {
                 <td>${escapeHtml(formatAuthType(account.auth_type))}</td>
                 <td>
                     <div class="table-primary-text">${escapeHtml(account.api_key_masked || '--')}</div>
-                    <div class="table-secondary-text">${escapeHtml(account.base_url || '') || '--'}</div>
                 </td>
                 <td>
                     <div class="table-primary-text">${escapeHtml(statusText)}</div>
-                    <div class="table-secondary-text">${escapeHtml(detailText || '--')}</div>
                 </td>
             `;
         }
