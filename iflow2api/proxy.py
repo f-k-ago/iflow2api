@@ -16,6 +16,7 @@ import urllib.parse
 
 from typing import Any, AsyncIterator, Literal, Optional, overload
 from .config import IFlowConfig
+from .official_cli_bridge import OfficialIFlowCLITransport
 from .tracing import get_current_traceparent, session_trace_context, span_context
 from .transport import BaseUpstreamTransport, create_upstream_transport
 
@@ -179,6 +180,7 @@ class IFlowProxy:
         self.config = config
         self.base_url = config.base_url.rstrip("/")
         self._client: Optional[BaseUpstreamTransport] = None
+        self._official_cli_bridge: Optional[OfficialIFlowCLITransport] = None
 
         # 优先复用账号持久化的 session / conversation id，降低漂移。
         self._session_id = (config.session_id or "").strip() or f"session-{uuid.uuid4()}"
@@ -518,6 +520,37 @@ class IFlowProxy:
 
         return self._client
 
+    async def _get_official_cli_bridge(self) -> OfficialIFlowCLITransport:
+        """获取或创建官方 iflow-cli builder bridge。"""
+        if self._official_cli_bridge is None:
+            from .settings import load_settings
+
+            settings = load_settings()
+            proxy = settings.upstream_proxy if settings.upstream_proxy_enabled and settings.upstream_proxy else None
+            self._official_cli_bridge = OfficialIFlowCLITransport(
+                timeout=300.0,
+                proxy=proxy,
+            )
+        return self._official_cli_bridge
+
+    def _build_official_chat_request_payload(
+        self,
+        request_body: dict,
+        *,
+        stream: bool,
+        traceparent: Optional[str],
+    ) -> dict[str, Any]:
+        """构造传给官方 Node bridge 的输入。"""
+        return {
+            "apiKey": self.config.api_key,
+            "baseUrl": self.base_url,
+            "sessionId": self._session_id,
+            "conversationId": self._conversation_id,
+            "traceparent": (traceparent or "").strip(),
+            "stream": stream,
+            "requestBody": request_body,
+        }
+
     @staticmethod
     def _normalize_response(result: dict, preserve_reasoning: bool = False) -> dict:
         """
@@ -770,6 +803,9 @@ class IFlowProxy:
         if self._client:
             await self._client.close()
             self._client = None
+        if self._official_cli_bridge:
+            await self._official_cli_bridge.close()
+            self._official_cli_bridge = None
 
     @staticmethod
     def _known_models() -> list[dict[str, str]]:
@@ -908,26 +944,12 @@ class IFlowProxy:
         """
         chat completions 的实际实现（内部方法）
         """
-        client = await self._get_client()
-        
         # 加载配置以获取思考链设置
         from .settings import load_settings
         settings = load_settings()
         preserve_reasoning = settings.preserve_reasoning_content
-        
-        # 先对齐官方通用默认参数，再按模型补充特定参数
-        request_body = self._align_official_body_defaults(request_body, stream=stream)
-
-        # 为特定模型添加必要的请求参数
-        # 来源: iFlow CLI 源码中的模型配置
-        # GLM-5 等思考模型需要 enable_thinking 参数才能正常工作
         model = request_body.get("model", "")
-        if "max_new_tokens" not in request_body:
-            request_body["max_new_tokens"] = self._resolve_official_max_new_tokens(
-                model,
-                request_body.get("max_tokens"),
-            )
-        request_body = self._configure_model_request(request_body, model)
+        official_cli_bridge = await self._get_official_cli_bridge()
 
         if stream:
             # 对于流式请求，使用 httpx 的 stream 方法实现真正的流式传输
@@ -947,22 +969,22 @@ class IFlowProxy:
                             completed_successfully = False
                             upstream_status_code: int | None = None
                             upstream_content_type = "unknown"
-                            headers = self._get_headers(stream=True)
+                            bridge_payload = self._build_official_chat_request_payload(
+                                request_body,
+                                stream=True,
+                                traceparent=telemetry_session.traceparent,
+                            )
 
                             # 调试：打印请求详情
                             logger.debug("流式请求 URL: %s/chat/completions", self.base_url)
-                            logger.debug("流式请求头: %s", json.dumps({k: v for k, v in headers.items() if k != 'Authorization'}, ensure_ascii=False))
                             logger.debug("流式请求体: model=%s, messages=%d, tools=%d",
                                          request_body.get('model'),
                                          len(request_body.get('messages', [])),
                                          len(request_body.get('tools', [])) if 'tools' in request_body else 0)
 
                             try:
-                                async with client.stream(
-                                    "POST",
-                                    f"{self.base_url}/chat/completions",
-                                    headers=headers,
-                                    json_body=request_body,
+                                async with official_cli_bridge.stream_chat_completions(
+                                    bridge_payload,
                                     timeout=300.0,
                                 ) as response:
                                     # 检查状态码
@@ -1093,10 +1115,13 @@ class IFlowProxy:
 
                     with span_context("iflow.chat.completions", attributes={"model": model, "stream": False}):
                         try:
-                            response = await client.post(
-                                f"{self.base_url}/chat/completions",
-                                headers=self._get_headers(),
-                                json_body=request_body,
+                            bridge_payload = self._build_official_chat_request_payload(
+                                request_body,
+                                stream=False,
+                                traceparent=telemetry_session.traceparent,
+                            )
+                            response = await official_cli_bridge.request_chat_completions(
+                                bridge_payload,
                                 timeout=300.0,
                             )
                             response.raise_for_status()

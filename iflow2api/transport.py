@@ -589,15 +589,17 @@ class NodeFetchTransport(BaseUpstreamTransport):
         timeout: float,
         follow_redirects: bool,
         proxy: Optional[str],
+        worker_script: Path | None = None,
     ):
         self._timeout = timeout
         self._follow_redirects = follow_redirects
         self._proxy = proxy
         self._node_path = shutil.which("node")
+        self._worker_script = worker_script or _NODE_BRIDGE_SCRIPT
         if not self._node_path:
             raise RuntimeError("未找到 node 可执行文件，无法启用 node_fetch 传输层")
-        if not _NODE_BRIDGE_SCRIPT.exists():
-            raise RuntimeError(f"Node fetch bridge 脚本不存在: {_NODE_BRIDGE_SCRIPT}")
+        if not self._worker_script.exists():
+            raise RuntimeError(f"Node fetch bridge 脚本不存在: {self._worker_script}")
         self._worker: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._request_lock = asyncio.Lock()
@@ -609,7 +611,7 @@ class NodeFetchTransport(BaseUpstreamTransport):
 
         process = await asyncio.create_subprocess_exec(
             self._node_path,
-            str(_NODE_BRIDGE_SCRIPT),
+            str(self._worker_script),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
