@@ -373,6 +373,7 @@ async function loadSettings() {
         
         // 填充上游 API 设置
         document.getElementById('setting-api-concurrency').value = data.api_concurrency || 1;
+        document.getElementById('setting-max-queued-requests').value = data.max_queued_requests ?? 100;
         
         // 填充安全认证设置
         document.getElementById('setting-custom-api-key').value = data.custom_api_key || '';
@@ -403,6 +404,7 @@ async function saveSettings() {
         preserve_reasoning_content: document.getElementById('setting-preserve-reasoning').checked,
         // 上游 API 设置
         api_concurrency: parseInt(document.getElementById('setting-api-concurrency').value) || 1,
+        max_queued_requests: parseInt(document.getElementById('setting-max-queued-requests').value) || 0,
         // 安全认证设置
         custom_api_key: document.getElementById('setting-custom-api-key').value,
         custom_auth_header: document.getElementById('setting-custom-auth-header').value,

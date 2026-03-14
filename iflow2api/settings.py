@@ -139,6 +139,7 @@ class AppSettings(BaseModel):
     # - 非流式请求：主动取消后需等待运行完毕才释放令牌
     enable_concurrency_limit: bool = True
     max_concurrent_requests: int = 1
+    max_queued_requests: int = Field(default=100, ge=0, le=10000)
 
     # 上游 API 并发设置（已废弃，由 enable_concurrency_limit 替代）
     # 注意：过高的并发数可能导致上游 API 返回 429 限流错误
@@ -456,6 +457,8 @@ def load_settings() -> AppSettings:
                 # 上游 API 并发设置
                 if "api_concurrency" in data:
                     settings.api_concurrency = data["api_concurrency"]
+                if "max_queued_requests" in data:
+                    settings.max_queued_requests = data["max_queued_requests"]
                 # OAuth 设置
                 if "auth_type" in data:
                     settings.auth_type = data["auth_type"]
@@ -563,6 +566,7 @@ def save_settings(settings: AppSettings) -> None:
         "preserve_reasoning_content": settings.preserve_reasoning_content,
         # 上游 API 并发设置
         "api_concurrency": settings.api_concurrency,
+        "max_queued_requests": settings.max_queued_requests,
         # 语言设置
         "language": settings.language,
         # 更新检查设置

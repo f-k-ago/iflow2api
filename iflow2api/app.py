@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
-from .account_pool import NoUpstreamAccountError, acquire_account_lease
+from .account_pool import NoUpstreamAccountError, UpstreamQueueFullError, acquire_account_lease
 from .config import load_iflow_config, check_iflow_login, IFlowConfig
 from .proxy import IFlowProxy
 from .token_refresher import OAuthTokenRefresher
@@ -602,6 +602,31 @@ async def _acquire_upstream_lease():
         raise IFlowNotConfiguredError(str(exc)) from exc
 
 
+def _get_upstream_busy_message(exc: BaseException) -> str:
+    """提取账号池忙碌/排队相关提示。"""
+    message = str(exc).strip()
+    return message or "当前所有上游账号都在忙，请稍后重试"
+
+
+def _create_openai_busy_response(exc: BaseException) -> JSONResponse:
+    """返回 OpenAI 兼容的 429 忙碌响应。"""
+    return create_error_response(429, _get_upstream_busy_message(exc), "rate_limit_exceeded")
+
+
+def _create_anthropic_busy_response(exc: BaseException) -> JSONResponse:
+    """返回 Anthropic 兼容的 429 忙碌响应。"""
+    return JSONResponse(
+        status_code=429,
+        content={
+            "type": "error",
+            "error": {
+                "type": "rate_limit_exceeded",
+                "message": _get_upstream_busy_message(exc),
+            },
+        },
+    )
+
+
 async def _run_nonstream_with_lease(lease, request_body: dict) -> dict:
     """执行非流式请求；客户端取消时等待上游运行结束后再释放账号。"""
     task = asyncio.create_task(
@@ -1178,8 +1203,8 @@ async def chat_completions_openai(request: Request):
                 lease = await _acquire_upstream_lease()
             except IFlowNotConfiguredError as e:
                 return create_error_response(503, str(e), "iflow_not_configured")
-            except asyncio.TimeoutError:
-                return create_error_response(429, "当前所有上游账号都在忙，请稍后重试", "rate_limit_exceeded")
+            except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
+                return _create_openai_busy_response(e)
 
             logger.debug("分配上游账号: account_id=%s, label=%s", lease.account.id, lease.account.label)
 
@@ -1255,8 +1280,8 @@ async def chat_completions_openai(request: Request):
                 lease = await _acquire_upstream_lease()
             except IFlowNotConfiguredError as e:
                 return create_error_response(503, str(e), "iflow_not_configured")
-            except asyncio.TimeoutError:
-                return create_error_response(429, "当前所有上游账号都在忙，请稍后重试", "rate_limit_exceeded")
+            except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
+                return _create_openai_busy_response(e)
 
             try:
                 logger.debug("获取上游非流式响应: account_id=%s", lease.account.id)
@@ -1442,11 +1467,8 @@ async def messages_anthropic(request: Request):
                     status_code=503,
                     content={"type": "error", "error": {"type": "iflow_not_configured", "message": str(e)}}
                 )
-            except asyncio.TimeoutError:
-                return JSONResponse(
-                    status_code=429,
-                    content={"type": "error", "error": {"type": "rate_limit_exceeded", "message": "当前所有上游账号都在忙，请稍后重试"}}
-                )
+            except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
+                return _create_anthropic_busy_response(e)
 
             logger.debug("获取上游流式响应 (Anthropic): account_id=%s", lease.account.id)
             try:
@@ -1606,11 +1628,8 @@ async def messages_anthropic(request: Request):
                     status_code=503,
                     content={"type": "error", "error": {"type": "iflow_not_configured", "message": str(e)}}
                 )
-            except asyncio.TimeoutError:
-                return JSONResponse(
-                    status_code=429,
-                    content={"type": "error", "error": {"type": "rate_limit_exceeded", "message": "当前所有上游账号都在忙，请稍后重试"}}
-                )
+            except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
+                return _create_anthropic_busy_response(e)
 
             try:
                 logger.debug("获取上游非流式响应 (Anthropic): account_id=%s", lease.account.id)
@@ -1664,8 +1683,8 @@ async def root_post(request: Request):
                 lease = await _acquire_upstream_lease()
             except IFlowNotConfiguredError as e:
                 return create_error_response(503, str(e), "iflow_not_configured")
-            except asyncio.TimeoutError:
-                return create_error_response(429, "当前所有上游账号都在忙，请稍后重试", "rate_limit_exceeded")
+            except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
+                return _create_openai_busy_response(e)
 
             try:
                 stream_gen = await lease.proxy.chat_completions(
@@ -1701,8 +1720,8 @@ async def root_post(request: Request):
                 lease = await _acquire_upstream_lease()
             except IFlowNotConfiguredError as e:
                 return create_error_response(503, str(e), "iflow_not_configured")
-            except asyncio.TimeoutError:
-                return create_error_response(429, "当前所有上游账号都在忙，请稍后重试", "rate_limit_exceeded")
+            except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
+                return _create_openai_busy_response(e)
 
             try:
                 logger.debug("获取上游非流式响应 (root_post): account_id=%s", lease.account.id)

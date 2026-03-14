@@ -265,7 +265,12 @@
                                     <label for="setting-api-concurrency">并发数</label>
                                     <input type="number" id="setting-api-concurrency" name="api_concurrency" min="1" max="10" value="1">
                                 </div>
+                                <div class="form-group">
+                                    <label for="setting-max-queued-requests">最大排队数</label>
+                                    <input type="number" id="setting-max-queued-requests" name="max_queued_requests" min="0" max="10000" value="100">
+                                </div>
                                 <p class="hint">上游 API 同时处理的请求数量（1-10）。警告：过高的并发数可能导致上游 API 返回 429 限流错误，建议保持默认值 1</p>
+                                <p class="hint">超过最大排队数后，新请求会立即返回 429。设置为 0 表示不允许额外排队，只接受当前可立即分配到账号槽位的请求。</p>
                             </form>
                         </div>
                     </div>

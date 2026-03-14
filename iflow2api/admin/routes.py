@@ -50,6 +50,7 @@ class SettingsUpdate(BaseModel):
     theme_mode: Optional[str] = None
     preserve_reasoning_content: Optional[bool] = None
     api_concurrency: Optional[int] = None
+    max_queued_requests: Optional[int] = None
     language: Optional[str] = None
     custom_api_key: Optional[str] = None
     custom_auth_header: Optional[str] = None
@@ -362,11 +363,13 @@ def _find_upstream_account(settings, account_id: str):
 @admin_router.get("/account-info")
 async def get_account_info(username: str = Depends(get_current_user)) -> dict[str, Any]:
     """获取账号池概览与兼容代表账号信息。"""
+    from ..account_pool import get_account_pool_stats
     from ..settings import get_enabled_upstream_accounts, get_primary_account, list_upstream_accounts, load_settings
 
     settings = load_settings()
     accounts = list_upstream_accounts(settings)
     primary_account = get_primary_account(settings, include_disabled=True)
+    pool_stats = get_account_pool_stats()
 
     if not accounts or primary_account is None:
         return {
@@ -376,6 +379,7 @@ async def get_account_info(username: str = Depends(get_current_user)) -> dict[st
             "accounts": [],
             "total_accounts": 0,
             "enabled_accounts": 0,
+            "pool_stats": pool_stats,
         }
 
     account_info = {
@@ -391,6 +395,7 @@ async def get_account_info(username: str = Depends(get_current_user)) -> dict[st
         ],
         "total_accounts": len(accounts),
         "enabled_accounts": len(get_enabled_upstream_accounts(settings)),
+        "pool_stats": pool_stats,
     }
     return account_info
 
@@ -408,6 +413,7 @@ async def get_settings(username: str = Depends(get_current_user)) -> dict[str, A
         "theme_mode": settings.theme_mode,
         "preserve_reasoning_content": settings.preserve_reasoning_content,
         "api_concurrency": settings.api_concurrency,
+        "max_queued_requests": settings.max_queued_requests,
         "language": settings.language,
         "custom_api_key": settings.custom_api_key,
         "custom_auth_header": settings.custom_auth_header,
@@ -441,6 +447,8 @@ async def update_settings(
         settings.preserve_reasoning_content = request.preserve_reasoning_content
     if request.api_concurrency is not None:
         settings.api_concurrency = request.api_concurrency
+    if request.max_queued_requests is not None:
+        settings.max_queued_requests = request.max_queued_requests
     if request.language is not None:
         settings.language = request.language
     if request.custom_api_key is not None:

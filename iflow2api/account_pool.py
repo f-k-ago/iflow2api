@@ -1,9 +1,10 @@
 """上游账号池调度与租约管理。"""
 
 import asyncio
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from .concurrency_limiter import ConcurrencyLimiter, get_concurrency_limiter
 from .config import IFlowConfig
@@ -12,7 +13,14 @@ from .settings import DEFAULT_BASE_URL, UpstreamAccount, get_enabled_upstream_ac
 
 
 class NoUpstreamAccountError(Exception):
-    """没有可用上游账号。"""
+    """没有可用的上游账号。"""
+
+
+class UpstreamQueueFullError(asyncio.TimeoutError):
+    """上游账号排队队列已满。"""
+
+
+QUEUE_RECHECK_INTERVAL_SECONDS = 1.0
 
 
 def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -50,6 +58,7 @@ class AccountLease:
     proxy: IFlowProxy
     limiter: Optional[ConcurrencyLimiter] = None
     limiter_key: str = ""
+    on_release: Optional[Callable[[], Awaitable[None]]] = None
     _closed: bool = False
 
     async def close(self) -> None:
@@ -61,56 +70,180 @@ class AccountLease:
         finally:
             if self.limiter and self.limiter_key:
                 self.limiter.release(self.limiter_key)
+            if self.on_release is not None:
+                await self.on_release()
 
 
-_round_robin_lock = asyncio.Lock()
+@dataclass(slots=True)
+class _LeaseWaiter:
+    """等待账号租约的排队请求。"""
+
+    sequence: int
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+_scheduler_lock = asyncio.Lock()
+_wait_queue: deque[_LeaseWaiter] = deque()
+_waiter_sequence = 0
 _round_robin_index = 0
 
 
-async def _rotate_accounts(accounts: list[UpstreamAccount]) -> list[UpstreamAccount]:
-    """轮转账号顺序，避免总是命中第一个账号。"""
+def _next_waiter_sequence() -> int:
+    """生成单调递增的等待序号。"""
+    global _waiter_sequence
+    _waiter_sequence += 1
+    return _waiter_sequence
+
+
+def _rotate_accounts_locked(accounts: list[UpstreamAccount]) -> list[UpstreamAccount]:
+    """轮转账号顺序，避免总是命中第一个账号。调用方需持有调度锁。"""
     global _round_robin_index
 
     if not accounts:
         return []
 
-    async with _round_robin_lock:
-        start = _round_robin_index % len(accounts)
-        _round_robin_index = (_round_robin_index + 1) % len(accounts)
-
+    start = _round_robin_index % len(accounts)
+    _round_robin_index = (_round_robin_index + 1) % len(accounts)
     return accounts[start:] + accounts[:start]
+
+
+def _wake_next_waiter_locked() -> None:
+    """唤醒队首等待者。调用方需持有调度锁。"""
+    if _wait_queue:
+        _wait_queue[0].event.set()
+
+
+def _remove_waiter_locked(waiter: _LeaseWaiter) -> None:
+    """从队列中移除等待者并在必要时唤醒下一位。调用方需持有调度锁。"""
+    was_head = bool(_wait_queue) and _wait_queue[0] is waiter
+    try:
+        _wait_queue.remove(waiter)
+    except ValueError:
+        return
+    if was_head:
+        _wake_next_waiter_locked()
+
+
+async def _notify_wait_queue() -> None:
+    """在租约释放后唤醒队首等待者。"""
+    async with _scheduler_lock:
+        _wake_next_waiter_locked()
+
+
+def _build_account_lease(
+    account: UpstreamAccount,
+    limiter: Optional[ConcurrencyLimiter] = None,
+    limiter_key: str = "",
+) -> AccountLease:
+    """创建账号租约对象。"""
+    return AccountLease(
+        account=account,
+        proxy=IFlowProxy(build_iflow_config_from_account(account)),
+        limiter=limiter,
+        limiter_key=limiter_key,
+        on_release=_notify_wait_queue,
+    )
+
+
+def _try_allocate_lease_locked(settings, accounts: list[UpstreamAccount]) -> Optional[AccountLease]:
+    """尝试立即分配一个租约。调用方需持有调度锁。"""
+    ordered_accounts = _rotate_accounts_locked(accounts)
+    if not settings.enable_concurrency_limit:
+        if not ordered_accounts:
+            return None
+        return _build_account_lease(ordered_accounts[0])
+
+    limiter = get_concurrency_limiter(max_concurrent=settings.max_concurrent_requests)
+    for account in ordered_accounts:
+        if limiter.try_acquire_nowait(account.id):
+            return _build_account_lease(
+                account=account,
+                limiter=limiter,
+                limiter_key=account.id,
+            )
+    return None
 
 
 async def acquire_account_lease(timeout: float = 300.0) -> AccountLease:
     """获取一个可用账号租约。"""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
+    waiter: Optional[_LeaseWaiter] = None
 
-    while True:
-        settings = load_settings()
-        accounts = get_enabled_upstream_accounts(settings)
-        if not accounts:
-            raise NoUpstreamAccountError("没有可用的上游账号，请先在管理界面添加并启用账号")
+    settings = load_settings()
+    accounts = get_enabled_upstream_accounts(settings)
+    if not accounts:
+        raise NoUpstreamAccountError("没有可用的上游账号，请先在管理界面添加并启用账号")
 
-        ordered_accounts = await _rotate_accounts(accounts)
+    async with _scheduler_lock:
         if not settings.enable_concurrency_limit:
-            account = ordered_accounts[0]
-            return AccountLease(
-                account=account,
-                proxy=IFlowProxy(build_iflow_config_from_account(account)),
-            )
+            lease = _try_allocate_lease_locked(settings, accounts)
+            if lease is None:
+                raise NoUpstreamAccountError("没有可用的上游账号，请先在管理界面添加并启用账号")
+            return lease
 
-        limiter = get_concurrency_limiter(max_concurrent=settings.max_concurrent_requests)
-        for account in ordered_accounts:
-            if limiter.try_acquire_nowait(account.id):
-                return AccountLease(
-                    account=account,
-                    proxy=IFlowProxy(build_iflow_config_from_account(account)),
-                    limiter=limiter,
-                    limiter_key=account.id,
+        if not _wait_queue:
+            lease = _try_allocate_lease_locked(settings, accounts)
+            if lease is not None:
+                return lease
+
+        if len(_wait_queue) >= settings.max_queued_requests:
+            raise UpstreamQueueFullError("当前排队请求过多，请稍后重试")
+
+        waiter = _LeaseWaiter(sequence=_next_waiter_sequence())
+        _wait_queue.append(waiter)
+        if _wait_queue[0] is waiter:
+            waiter.event.set()
+
+    promoted = False
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("等待可用上游账号超时")
+
+            if not promoted:
+                await asyncio.wait_for(waiter.event.wait(), timeout=remaining)
+                waiter.event.clear()
+                promoted = True
+
+            settings = load_settings()
+            accounts = get_enabled_upstream_accounts(settings)
+            if not accounts:
+                raise NoUpstreamAccountError("没有可用的上游账号，请先在管理界面添加并启用账号")
+
+            async with _scheduler_lock:
+                if not _wait_queue or _wait_queue[0] is not waiter:
+                    promoted = False
+                    continue
+
+                lease = _try_allocate_lease_locked(settings, accounts)
+                if lease is not None:
+                    _wait_queue.popleft()
+                    _wake_next_waiter_locked()
+                    return lease
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("等待可用上游账号超时")
+
+            try:
+                await asyncio.wait_for(
+                    waiter.event.wait(),
+                    timeout=min(remaining, QUEUE_RECHECK_INTERVAL_SECONDS),
                 )
+            except asyncio.TimeoutError:
+                continue
+            else:
+                waiter.event.clear()
+    finally:
+        if waiter is not None:
+            async with _scheduler_lock:
+                _remove_waiter_locked(waiter)
 
-        if loop.time() >= deadline:
-            raise asyncio.TimeoutError("等待可用上游账号超时")
 
-        await asyncio.sleep(0.1)
+def get_account_pool_stats() -> dict[str, int]:
+    """返回账号池排队概况。"""
+    return {
+        "queued_requests": len(_wait_queue),
+    }
