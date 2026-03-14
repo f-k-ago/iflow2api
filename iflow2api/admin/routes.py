@@ -49,7 +49,6 @@ class SettingsUpdate(BaseModel):
     oauth_callback_base_url: Optional[str] = None
     theme_mode: Optional[str] = None
     preserve_reasoning_content: Optional[bool] = None
-    api_concurrency: Optional[int] = None
     max_queued_requests: Optional[int] = None
     language: Optional[str] = None
     custom_api_key: Optional[str] = None
@@ -412,7 +411,6 @@ async def get_settings(username: str = Depends(get_current_user)) -> dict[str, A
         "oauth_callback_base_url": settings.oauth_callback_base_url,
         "theme_mode": settings.theme_mode,
         "preserve_reasoning_content": settings.preserve_reasoning_content,
-        "api_concurrency": settings.api_concurrency,
         "max_queued_requests": settings.max_queued_requests,
         "language": settings.language,
         "custom_api_key": settings.custom_api_key,
@@ -445,8 +443,6 @@ async def update_settings(
         settings.theme_mode = request.theme_mode
     if request.preserve_reasoning_content is not None:
         settings.preserve_reasoning_content = request.preserve_reasoning_content
-    if request.api_concurrency is not None:
-        settings.api_concurrency = request.api_concurrency
     if request.max_queued_requests is not None:
         settings.max_queued_requests = request.max_queued_requests
     if request.language is not None:

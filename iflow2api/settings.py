@@ -141,9 +141,7 @@ class AppSettings(BaseModel):
     max_concurrent_requests: int = 1
     max_queued_requests: int = Field(default=100, ge=0, le=10000)
 
-    # 上游 API 并发设置（已废弃，由 enable_concurrency_limit 替代）
-    # 注意：过高的并发数可能导致上游 API 返回 429 限流错误
-    # 默认值为 1，表示串行处理；建议范围 1-10
+    # 兼容旧配置的遗留字段，运行时不再使用
     api_concurrency: int = Field(default=1, ge=1, le=10)
 
     # 语言设置

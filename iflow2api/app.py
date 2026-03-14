@@ -660,7 +660,7 @@ async def lifespan(app: FastAPI):
     from .settings import get_enabled_upstream_accounts, load_settings
     settings = load_settings()
     enabled_accounts = get_enabled_upstream_accounts(settings)
-    effective_concurrency = max(settings.api_concurrency, len(enabled_accounts), 1)
+    effective_concurrency = max(len(enabled_accounts), 1)
     _api_request_lock = asyncio.Semaphore(effective_concurrency)
     logger.info(
         "账号池状态: enabled=%d, configured_total=%d, runtime_concurrency=%d",
