@@ -370,7 +370,34 @@ class OAuthTokenRefresher:
                 token_data = await oauth.refresh_token(config.oauth_refresh_token)
 
                 access_token = token_data.get("access_token", "")
-                config.api_key = access_token
+                refreshed_api_key = (account.api_key or config.api_key or "").strip()
+                user_info: dict[str, str] = {}
+                if access_token:
+                    try:
+                        raw_user_info = await oauth.get_user_info(access_token)
+                    except Exception as user_info_error:
+                        logger.warning(
+                            "OAuth token 已刷新，但获取用户信息失败，保留现有 api_key: account_id=%s, error=%s",
+                            account.id,
+                            user_info_error,
+                        )
+                    else:
+                        user_info = {
+                            "apiKey": str(raw_user_info.get("apiKey") or "").strip(),
+                            "email": str(raw_user_info.get("email") or "").strip(),
+                            "phone": str(raw_user_info.get("phone") or "").strip(),
+                        }
+                        if user_info["apiKey"]:
+                            refreshed_api_key = user_info["apiKey"]
+                        else:
+                            logger.warning(
+                                "OAuth token 已刷新，但用户信息中缺少 apiKey，保留现有 api_key: account_id=%s",
+                                account.id,
+                            )
+                if not refreshed_api_key:
+                    raise ValueError("OAuth 刷新成功，但无法确定可用的 apiKey")
+
+                config.api_key = refreshed_api_key
                 config.oauth_access_token = access_token
                 if token_data.get("refresh_token"):
                     config.oauth_refresh_token = token_data["refresh_token"]
@@ -378,13 +405,19 @@ class OAuthTokenRefresher:
                     config.oauth_expires_at = token_data["expires_at"]
                     config.api_key_expires_at = token_data["expires_at"]
 
-                account.api_key = access_token
+                account.api_key = refreshed_api_key
                 account.auth_type = "oauth-iflow"
                 account.oauth_access_token = access_token
                 if token_data.get("refresh_token"):
                     account.oauth_refresh_token = token_data["refresh_token"]
                 if token_data.get("expires_at"):
                     account.oauth_expires_at = token_data["expires_at"].isoformat()
+                if user_info.get("email"):
+                    account.email = user_info["email"]
+                if user_info.get("phone"):
+                    account.phone = user_info["phone"]
+                if user_info.get("email") and not account.label:
+                    account.label = user_info["email"]
 
                 self._persist_account(account)
 
