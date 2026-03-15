@@ -9,7 +9,7 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from .crypto import ConfigEncryption
-from .request_identity import strip_legacy_generated_request_ids
+from .request_identity import normalize_request_ids
 
 logger = logging.getLogger("iflow2api")
 
@@ -108,7 +108,7 @@ def _select_primary_account(data: dict[str, Any]) -> Optional[dict[str, Any]]:
 def _build_config_from_mapping(raw: dict[str, Any]) -> IFlowConfig:
     """把配置字典转换为 IFlowConfig。"""
     oauth_expires_at = _parse_datetime(raw.get("oauth_expires_at"))
-    session_id, conversation_id, _ = strip_legacy_generated_request_ids(
+    session_id, conversation_id = normalize_request_ids(
         raw.get("session_id"),
         raw.get("conversation_id"),
     )

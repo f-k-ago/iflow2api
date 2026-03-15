@@ -19,8 +19,21 @@ class _DummyAccount:
     conversation_id = "conversation-1"
 
 
+class _DummyProxyConfig:
+    auth_type = "oauth-iflow"
+    base_url = "https://apis.iflow.cn/v1"
+    api_key = "sk-demo-secret"
+
+
+class _DummyProxy:
+    config = _DummyProxyConfig()
+    _session_id = "session-runtime"
+    _conversation_id = "conversation-1"
+
+
 class _DummyLease:
     account = _DummyAccount()
+    proxy = _DummyProxy()
 
 
 def test_api_key_fingerprint_hides_plaintext() -> None:
@@ -50,7 +63,7 @@ def test_build_lease_debug_context_extracts_request_shape() -> None:
         "auth_type": "oauth-iflow",
         "base_url": "https://apis.iflow.cn/v1",
         "api_key_fp": api_key_fingerprint("sk-demo-secret"),
-        "has_session_id": False,
+        "has_session_id": True,
         "has_conversation_id": True,
         "model": "glm-5",
         "message_count": 1,

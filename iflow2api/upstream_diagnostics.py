@@ -60,20 +60,35 @@ def build_lease_debug_context(
 ) -> dict[str, Any]:
     """提取与一次上游调用相关的安全诊断上下文。"""
     account = getattr(lease, "account", None)
+    proxy = getattr(lease, "proxy", None)
+    proxy_config = getattr(proxy, "config", None)
     body = request_body if isinstance(request_body, dict) else {}
     messages = body.get("messages")
     tools = body.get("tools")
+    runtime_session_id = str(
+        getattr(proxy, "_session_id", "") or getattr(account, "session_id", "") or ""
+    ).strip()
+    runtime_conversation_id = str(
+        getattr(proxy, "_conversation_id", "") or getattr(account, "conversation_id", "") or ""
+    ).strip()
+    auth_type = str(
+        getattr(proxy_config, "auth_type", "") or getattr(account, "auth_type", "") or "unknown"
+    ).strip() or "unknown"
+    base_url = str(
+        getattr(proxy_config, "base_url", "") or getattr(account, "base_url", "") or "-"
+    ).strip() or "-"
+    api_key = getattr(proxy_config, "api_key", "") or getattr(account, "api_key", "")
 
     return {
         "endpoint": endpoint,
         "stream": stream,
         "account_id": getattr(account, "id", "-"),
         "label": getattr(account, "label", "") or "-",
-        "auth_type": getattr(account, "auth_type", "") or "unknown",
-        "base_url": getattr(account, "base_url", "") or "-",
-        "api_key_fp": api_key_fingerprint(getattr(account, "api_key", "")),
-        "has_session_id": bool(getattr(account, "session_id", "")),
-        "has_conversation_id": bool(getattr(account, "conversation_id", "")),
+        "auth_type": auth_type,
+        "base_url": base_url,
+        "api_key_fp": api_key_fingerprint(api_key),
+        "has_session_id": bool(runtime_session_id),
+        "has_conversation_id": bool(runtime_conversation_id),
         "model": str(body.get("model") or "unknown"),
         "message_count": len(messages) if isinstance(messages, list) else 0,
         "tool_count": len(tools) if isinstance(tools, list) else 0,

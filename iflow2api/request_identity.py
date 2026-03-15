@@ -1,27 +1,9 @@
-"""上游 request identity 规范化辅助函数。"""
+"""上游 request identity 规范化与补全辅助函数。"""
 
 from __future__ import annotations
 
-import re
 from typing import Any
-
-_CANONICAL_UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-"
-    r"[0-9a-f]{4}-"
-    r"[1-5][0-9a-f]{3}-"
-    r"[89ab][0-9a-f]{3}-"
-    r"[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
-_LEGACY_SESSION_ID_RE = re.compile(
-    r"^session-"
-    r"([0-9a-f]{8}-"
-    r"[0-9a-f]{4}-"
-    r"[1-5][0-9a-f]{3}-"
-    r"[89ab][0-9a-f]{3}-"
-    r"[0-9a-f]{12})$",
-    re.IGNORECASE,
-)
+from uuid import uuid4
 
 
 def normalize_request_ids(
@@ -32,35 +14,32 @@ def normalize_request_ids(
     return str(session_id or "").strip(), str(conversation_id or "").strip()
 
 
-def is_legacy_generated_request_ids(
-    session_id: Any,
-    conversation_id: Any,
-) -> bool:
-    """判断是否命中旧版 iflow2api 自动生成的 request identity 形状。"""
-    normalized_session_id, normalized_conversation_id = normalize_request_ids(
-        session_id,
-        conversation_id,
-    )
-    return bool(
-        normalized_session_id
-        and normalized_conversation_id
-        and _LEGACY_SESSION_ID_RE.fullmatch(normalized_session_id)
-        and _CANONICAL_UUID_RE.fullmatch(normalized_conversation_id)
-    )
+def generate_session_id() -> str:
+    """生成与官方 CLI 非交互路径兼容的 session id。"""
+    return f"session-{uuid4()}"
 
 
-def strip_legacy_generated_request_ids(
+def generate_conversation_id() -> str:
+    """生成与官方 CLI 非交互路径兼容的 conversation id。"""
+    return str(uuid4())
+
+
+def ensure_request_ids(
     session_id: Any,
     conversation_id: Any,
 ) -> tuple[str, str, bool]:
-    """清理旧版 iflow2api 自动生成的 request identity。"""
+    """补齐缺失的 request identity，避免上游因空值拒绝请求。"""
     normalized_session_id, normalized_conversation_id = normalize_request_ids(
         session_id,
         conversation_id,
     )
-    if is_legacy_generated_request_ids(
-        normalized_session_id,
-        normalized_conversation_id,
-    ):
-        return "", "", True
-    return normalized_session_id, normalized_conversation_id, False
+    generated = False
+
+    if not normalized_session_id:
+        normalized_session_id = generate_session_id()
+        generated = True
+    if not normalized_conversation_id:
+        normalized_conversation_id = generate_conversation_id()
+        generated = True
+
+    return normalized_session_id, normalized_conversation_id, generated

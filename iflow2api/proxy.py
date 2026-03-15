@@ -17,7 +17,7 @@ import urllib.parse
 from typing import Any, AsyncIterator, Literal, Optional, overload
 from .config import IFlowConfig
 from .official_cli_bridge import OfficialIFlowCLITransport
-from .request_identity import strip_legacy_generated_request_ids
+from .request_identity import ensure_request_ids
 from .tracing import get_current_traceparent, session_trace_context, span_context
 from .transport import BaseUpstreamTransport, create_upstream_transport
 
@@ -191,8 +191,9 @@ class IFlowProxy:
         self._client: Optional[BaseUpstreamTransport] = None
         self._official_cli_bridge: Optional[OfficialIFlowCLITransport] = None
 
-        # 官方请求主链读取配置里的 session / conversation id；没有就保持空字符串。
-        self._session_id, self._conversation_id, _ = strip_legacy_generated_request_ids(
+        # 官方 CLI 非交互路径会携带 session/conversation identity。
+        # 配置为空时，运行时补一组兼容值，避免上游把空 identity 视为无效请求。
+        self._session_id, self._conversation_id, _ = ensure_request_ids(
             config.session_id,
             config.conversation_id,
         )
