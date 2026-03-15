@@ -21,6 +21,23 @@ from .transport import (
 _OFFICIAL_IFLOW_CLI_BRIDGE = Path(__file__).with_name("iflow_cli_bridge.mjs")
 
 
+class OfficialBuilderValidationError(NodeFetchBridgeError):
+    """官方 builder 判定为非法输入。"""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.status_code = 400
+        self.error_type = "invalid_request_error"
+
+
+def _raise_bridge_error(event: dict[str, Any], default_message: str) -> None:
+    message = str(event.get("message") or default_message)
+    code = str(event.get("code") or "").strip()
+    if code == "invalid_request_error":
+        raise OfficialBuilderValidationError(message)
+    raise NodeFetchBridgeError(message)
+
+
 @dataclass(slots=True)
 class OfficialChatRequest:
     """官方 builder 生成的最终上游请求。"""
@@ -88,7 +105,7 @@ class OfficialIFlowCLITransport(NodeFetchTransport):
                 if event_type == "end":
                     break
                 if event_type == "error":
-                    raise NodeFetchBridgeError(str(event.get("message") or "官方 builder 请求失败"))
+                    _raise_bridge_error(event, "官方 builder 请求失败")
                 raise NodeFetchBridgeError(f"官方 builder 返回了未知事件: {event_type!r}")
         finally:
             self._release_request_lock()
@@ -134,7 +151,7 @@ class OfficialIFlowCLITransport(NodeFetchTransport):
                 if event_type == "aborted":
                     raise NodeFetchBridgeError("官方 bridge 请求已取消")
                 if event_type == "error":
-                    raise NodeFetchBridgeError(str(event.get("message") or "官方 bridge 请求失败"))
+                    _raise_bridge_error(event, "官方 bridge 请求失败")
                 raise NodeFetchBridgeError(f"官方 bridge 返回了未知事件: {event_type!r}")
         except asyncio.CancelledError:
             try:

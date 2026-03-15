@@ -1,6 +1,6 @@
 import asyncio
 
-from iflow2api.app import anthropic_to_openai_request
+from iflow2api.anthropic_compat import anthropic_to_openai_request
 from iflow2api.official_cli_bridge import OfficialIFlowCLITransport
 
 
@@ -111,9 +111,74 @@ def test_messages_with_tools_still_flow_through_official_header_builder():
                 "parameters": {
                     "type": "object",
                     "properties": {"city": {"type": "string"}},
+                    "additionalProperties": False,
                 },
             },
         }
     ]
     assert request.body["tool_choice"] == "required"
     assert request.body["max_new_tokens"] == 1000
+
+
+def test_messages_text_blocks_preserve_content_array_shape():
+    request = build_from_messages(
+        {
+            "model": "glm-5",
+            "max_tokens": 1000,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hello"},
+                        {"type": "text", "text": "world"},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert request.body["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "text", "text": "world"},
+            ],
+        }
+    ]
+
+
+def test_messages_assistant_tool_use_matches_official_content_and_argument_shape():
+    request = build_from_messages(
+        {
+            "model": "glm-5",
+            "max_tokens": 1000,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"x": 1}},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert request.body["messages"] == [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "toolu_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"x":1}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "toolu_1",
+            "content": "tool not executed",
+        },
+    ]

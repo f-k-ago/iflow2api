@@ -90,7 +90,7 @@ async function emitStreamingResponse(requestId, response) {
 async function handleBuildRequest(spec) {
   const requestId = typeof spec.request_id === "string" ? spec.request_id : "";
   try {
-    const payload = buildOfficialChatCompletionsRequest(spec.payload || {});
+    const payload = await buildOfficialChatCompletionsRequest(spec.payload || {});
     await writeEvent({
       request_id: requestId,
       type: "result",
@@ -119,7 +119,7 @@ async function handleChatCompletions(spec) {
 
   try {
     await ensureDispatcher(spec.proxy);
-    const officialRequest = buildOfficialChatCompletionsRequest(spec.payload || {});
+    const officialRequest = await buildOfficialChatCompletionsRequest(spec.payload || {});
     const response = await fetch(officialRequest.url, {
       method: "POST",
       headers: officialRequest.headers,

@@ -1,7 +1,9 @@
 import crypto from "node:crypto";
 
+import { normalizeChatRequestViaOfficialRoundTrip } from "./iflow_cli_official_roundtrip.mjs";
+
 export const IFLOW_CLI_USER_AGENT = "iFlow-Cli";
-export const IFLOW_CLI_VERSION = "0.5.17";
+export const IFLOW_CLI_VERSION = "0.5.17-beta-20260313";
 
 const OFFLINE_SESSION_HOSTS = [
   "offline-whale-wave.alibaba-inc.com",
@@ -334,7 +336,19 @@ function getModelCapability(model) {
   return capabilities.find((item) => item.pattern.test(model)) ?? null;
 }
 
-function applyThinkingConfig(originalModel, sourceBody, body, thinkingEnabled, resolvedMaxTokens) {
+function applyThinkingConfig(originalModel, sourceBody, body, thinkingEnabled, resolvedMaxTokens, officialHelpers) {
+  if (officialHelpers?.h2) {
+    const config = deriveThinkingConfig(sourceBody, resolvedMaxTokens);
+    if (thinkingEnabled === true) {
+      officialHelpers.h2.configureThinkingRequest(originalModel, body, config);
+      return;
+    }
+    if (thinkingEnabled !== true) {
+      officialHelpers.h2.configureNonThinkingRequest(originalModel, body);
+      return;
+    }
+  }
+
   const capability = getModelCapability(originalModel);
   if (!capability) {
     return;
@@ -367,6 +381,19 @@ function applyThinkingConfig(originalModel, sourceBody, body, thinkingEnabled, r
   }
 }
 
+function applyQwen4bCompatibility(originalModel, body) {
+  if (!/qwen.*4b/i.test(originalModel)) {
+    return;
+  }
+  delete body.thinking_mode;
+  delete body.reasoning;
+  delete body.chat_template_kwargs;
+  delete body.enable_thinking;
+  delete body.thinking;
+  body.extend_fields ??= {};
+  body.extend_fields.chat_template_kwargs = { enable_thinking: false };
+}
+
 function shouldCarryStop(stop) {
   if (Array.isArray(stop)) {
     return stop.length > 0;
@@ -387,17 +414,29 @@ function pickTemperatureSource(requestBody) {
   return { hasTemperature: false };
 }
 
-function buildOfficialBody({
+async function buildOfficialBody({
   requestBody,
   stream,
   baseUrl,
   sessionId,
+  conversationId,
 }) {
   const source = requestBody && typeof requestBody === "object" ? requestBody : {};
   const originalModel = String(source.model || "unknown");
+  const outputTokensLimit = resolveOutputTokensLimit(source);
+  const normalized = await normalizeChatRequestViaOfficialRoundTrip(source, {
+    apiKey: source.apiKey,
+    baseUrl,
+    sessionId,
+    conversationId,
+    outputTokensLimit,
+    strictOfficial: true,
+  });
+  const officialHelpers = normalized.helpers;
+  const resolveMaxNewTokens = officialHelpers?.MOt ?? resolveOfficialMaxNewTokens;
   const body = {
     model: originalModel,
-    messages: Array.isArray(source.messages) ? source.messages : [],
+    messages: Array.isArray(normalized.messages) ? normalized.messages : [],
   };
 
   if (stream) {
@@ -417,10 +456,10 @@ function buildOfficialBody({
   }
 
   const thinkingEnabled = resolveThinkingEnabled(source);
-  const outputTokensLimit = resolveOutputTokensLimit(source);
-  const provisionalMaxNewTokens = resolveOfficialMaxNewTokens(body.model, outputTokensLimit);
-  applyThinkingConfig(originalModel, source, body, thinkingEnabled, provisionalMaxNewTokens);
-  const resolvedMaxNewTokens = resolveOfficialMaxNewTokens(body.model, outputTokensLimit);
+  const provisionalMaxNewTokens = resolveMaxNewTokens(body.model, normalized.inputTokens ?? 0, outputTokensLimit);
+  applyThinkingConfig(originalModel, source, body, thinkingEnabled, provisionalMaxNewTokens, officialHelpers);
+  applyQwen4bCompatibility(originalModel, body);
+  const resolvedMaxNewTokens = resolveMaxNewTokens(body.model, normalized.inputTokens ?? 0, outputTokensLimit);
 
   if (originalModel.includes("glm-4.7") || originalModel.includes("glm-5")) {
     body.temperature = 1;
@@ -449,8 +488,12 @@ function buildOfficialBody({
     body.stop = source.stop;
   }
 
-  if (Array.isArray(source.tools) && source.tools.length > 0) {
-    body.tools = source.tools;
+  const normalizedTools = Array.isArray(normalized.tools) && normalized.tools.length > 0
+    ? normalized.tools
+    : null;
+
+  if (normalizedTools) {
+    body.tools = normalizedTools;
     if (source.tool_choice !== undefined) {
       body.tool_choice = source.tool_choice;
     } else if (originalModel.startsWith("kimi-k2.5") && body.thinking?.type === "enabled") {
@@ -460,6 +503,7 @@ function buildOfficialBody({
 
   if (OFFLINE_SESSION_HOSTS.some((host) => normalizeBaseUrl(baseUrl).includes(host))) {
     body.extend_fields = {
+      ...(body.extend_fields || {}),
       sessionId: String(sessionId || ""),
     };
   }
@@ -470,7 +514,10 @@ function buildOfficialBody({
     body.top_k = 20;
   }
 
-  return body;
+  return {
+    body,
+    normalizationSource: normalized.source || "local_fallback",
+  };
 }
 
 export function generateSignature(userAgent, sessionId, timestampMs, apiKey) {
@@ -517,18 +564,19 @@ function buildOfficialHeaders({
   return headers;
 }
 
-export function buildOfficialChatCompletionsRequest(input) {
+export async function buildOfficialChatCompletionsRequest(input) {
   const apiKey = String(input?.apiKey || "");
   const baseUrl = normalizeBaseUrl(String(input?.baseUrl || ""));
   const sessionId = String(input?.sessionId || "");
   const conversationId = String(input?.conversationId || "");
   const stream = Boolean(input?.stream);
   const timestampMs = isPositiveInteger(input?.timestampMs) ? input.timestampMs : Date.now();
-  const requestBody = buildOfficialBody({
+  const { body: requestBody, normalizationSource } = await buildOfficialBody({
     requestBody: input?.requestBody,
     stream,
     baseUrl,
     sessionId,
+    conversationId,
   });
 
   const headers = buildOfficialHeaders({
@@ -550,6 +598,7 @@ export function buildOfficialChatCompletionsRequest(input) {
       traceparent: headers.traceparent || "",
       timestampMs,
       scene: resolveScene(baseUrl),
+      normalizationSource,
     },
   };
 }

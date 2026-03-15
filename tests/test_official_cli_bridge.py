@@ -1,6 +1,11 @@
 import asyncio
 
-from iflow2api.official_cli_bridge import OfficialIFlowCLITransport
+import pytest
+
+from iflow2api.official_cli_bridge import (
+    OfficialBuilderValidationError,
+    OfficialIFlowCLITransport,
+)
 
 
 async def _build_via_bridge(request_body: dict, **extra):
@@ -86,7 +91,7 @@ def test_kimi_k25_tools_get_official_defaults():
                     "type": "function",
                     "function": {
                         "name": "foo",
-                        "parameters": {"type": "object", "properties": {}},
+                        "parameters": {"type": "object", "additionalProperties": False},
                     },
                 }
             ],
@@ -109,7 +114,7 @@ def test_kimi_k25_tools_get_official_defaults():
                 "type": "function",
                 "function": {
                     "name": "foo",
-                    "parameters": {"type": "object", "properties": {}},
+                    "parameters": {"type": "object", "additionalProperties": False},
                 },
             }
         ],
@@ -129,3 +134,181 @@ def test_offline_hosts_forward_extend_fields_session_id():
 
     assert request.body["extend_fields"] == {"sessionId": "session-offline"}
     assert request.body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_aone_request_uses_current_official_client_version():
+    request = build_request(
+        {
+            "model": "glm-5",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        baseUrl="https://ducky.code.alibaba-inc.com/v1/openai",
+    )
+
+    assert request.headers["X-Client-Type"] == "iflow-cli"
+    assert request.headers["X-Client-Version"] == "0.5.17-beta-20260313"
+
+
+def test_chat_developer_role_collapses_to_official_system_message():
+    request = build_request(
+        {
+            "model": "glm-5",
+            "messages": [
+                {"role": "developer", "content": "You are strict."},
+                {"role": "user", "content": "hi"},
+            ],
+        },
+    )
+
+    assert request.body["messages"] == [
+        {"role": "system", "content": "You are strict."},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_chat_tool_call_and_tool_result_roundtrip_via_official_converter():
+    request = build_request(
+        {
+            "model": "glm-5",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_weather",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup_weather",
+                                "arguments": '{"city":"Hangzhou"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "content": '{"temp":26}',
+                },
+            ],
+        },
+    )
+
+    assert request.body["messages"] == [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_weather",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_weather",
+                        "arguments": '{"city":"Hangzhou"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_weather",
+            "content": '{"temp":26}',
+        },
+    ]
+
+
+def test_strict_official_mode_rejects_non_data_url_images():
+    with pytest.raises(OfficialBuilderValidationError) as exc_info:
+        build_request(
+            {
+                "model": "glm-5",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "https://example.com/demo.png"},
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert "无法严格翻译" in str(exc_info.value)
+
+
+def test_qwen4b_scrubs_thinking_fields_into_extend_fields():
+    request = build_request(
+        {
+            "model": "qwen-4b-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled"},
+            "thinking_mode": True,
+            "reasoning": True,
+        },
+    )
+
+    assert request.body == {
+        "model": "qwen-4b-chat",
+        "messages": [{"role": "user", "content": "hi"}],
+        "extend_fields": {"chat_template_kwargs": {"enable_thinking": False}},
+        "max_new_tokens": 8000,
+    }
+
+
+def test_mock_official_bundle_shim_can_override_roundtrip_and_thinking(tmp_path, monkeypatch):
+    bundle_path = tmp_path / "iflow.js"
+    bundle_path.write_text(
+        """
+class gH {
+  constructor() {}
+  async convertToOpenAIMessages() {
+    return [{ role: "user", content: "shim-user" }];
+  }
+  convertToOpenAITools() {
+    return [];
+  }
+  async calculateInputTokens() {
+    return 17;
+  }
+}
+
+const h2 = {
+  configureThinkingRequest(model, body, cfg) {
+    body.bundle_thinking = cfg.maxTokens;
+    return true;
+  },
+  configureNonThinkingRequest(model, body) {
+    body.bundle_nonthinking = true;
+    return true;
+  },
+};
+
+function MOt(model, inputTokens = 0, explicitLimit) {
+  return explicitLimit || 4242;
+}
+
+async function Eao() {}
+Eao().catch(t => {
+    console.error("An unexpected critical error occurred:"), t instanceof Error ? console.error(t.stack) : console.error(String(t)), process.exit(1)
+});
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("IFLOW_OFFICIAL_BUNDLE_PATH", str(bundle_path))
+    monkeypatch.delenv("IFLOW_DISABLE_OFFICIAL_BUNDLE_SHIM", raising=False)
+
+    request = build_request(
+        {
+            "model": "glm-5",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert request.body["messages"] == [{"role": "user", "content": "shim-user"}]
+    assert request.body["bundle_nonthinking"] is True
+    assert request.body["max_new_tokens"] == 4242
+    assert request.meta["normalizationSource"] == "official_bundle"

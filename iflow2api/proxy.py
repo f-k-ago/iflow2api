@@ -26,7 +26,7 @@ logger = logging.getLogger("iflow2api")
 
 # iFlow CLI 特殊 User-Agent，用于解锁更多模型
 IFLOW_CLI_USER_AGENT = "iFlow-Cli"
-IFLOW_CLI_VERSION = "0.5.17"  # 与官方反混淆版本保持一致
+IFLOW_CLI_VERSION = "0.5.17-beta-20260313"  # 与当前官方 bundle 版本保持一致
 
 MMSTAT_GM_BASE = "https://gm.mmstat.com"
 MMSTAT_VGIF_URL = "https://log.mmstat.com/v.gif"
@@ -885,8 +885,7 @@ class IFlowProxy:
         注意：所有模型都支持图像输入，由上游 API 决定如何处理。
         """
         # iFlow CLI 支持的模型列表 (来源: uniflow_round2 反混淆代码)
-        # 与官方客户端 0.5.17 版本完全一致，避免被检测
-        # 2026.3.12 更新
+        # 与当前官方客户端 0.5.17-beta-20260313 的公开模型列表保持一致
         return self.build_models_response()
 
     @overload
