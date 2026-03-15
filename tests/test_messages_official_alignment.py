@@ -116,7 +116,7 @@ def test_messages_with_tools_still_flow_through_official_header_builder():
             },
         }
     ]
-    assert request.body["tool_choice"] == "required"
+    assert "tool_choice" not in request.body
     assert request.body["max_new_tokens"] == 1000
 
 

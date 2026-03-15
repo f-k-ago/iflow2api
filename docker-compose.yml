@@ -11,6 +11,7 @@ services:
       - "28000:28000"
     environment:
       HOME: /home/appuser
+      TZ: Asia/Shanghai
     volumes:
       # iflow2api 应用配置（WebUI 设置、账号池、管理员用户、日志、密钥）
       - ./data/iflow2api:/home/appuser/.iflow2api

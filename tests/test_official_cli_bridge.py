@@ -146,8 +146,8 @@ def test_aone_request_uses_current_official_client_version():
         baseUrl="https://ducky.code.alibaba-inc.com/v1/openai",
     )
 
-    assert request.headers["X-Client-Type"] == "iflow-cli"
-    assert request.headers["X-Client-Version"] == "0.5.17-beta-20260313"
+    assert "X-Client-Type" not in request.headers
+    assert "X-Client-Version" not in request.headers
 
 
 def test_chat_developer_role_collapses_to_official_system_message():
@@ -254,7 +254,6 @@ def test_qwen4b_scrubs_thinking_fields_into_extend_fields():
     assert request.body == {
         "model": "qwen-4b-chat",
         "messages": [{"role": "user", "content": "hi"}],
-        "extend_fields": {"chat_template_kwargs": {"enable_thinking": False}},
         "max_new_tokens": 8000,
     }
 
@@ -264,7 +263,11 @@ def test_mock_official_bundle_shim_can_override_roundtrip_and_thinking(tmp_path,
     bundle_path.write_text(
         """
 class gH {
-  constructor() {}
+  constructor(options = {}) {
+    this.apiKey = options.apiKey;
+    this.baseUrl = options.baseUrl;
+    this.config = options.config;
+  }
   async convertToOpenAIMessages() {
     return [{ role: "user", content: "shim-user" }];
   }
@@ -273,6 +276,28 @@ class gH {
   }
   async calculateInputTokens() {
     return 17;
+  }
+  async generateContentInternal(e, r, n) {
+    const p = {
+      model: this.config?.getModel?.() || "glm-5",
+      messages: [{ role: "user", content: "shim-user" }],
+      bundle_nonthinking: true,
+      max_new_tokens: 4242,
+    };
+    n && n(p);
+    await fetch(`${this.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
+        "user-agent": "iFlow-Cli",
+        "session-id": this.config?.getSessionId?.() || "",
+        "conversation-id": this.config?.getConversationId?.() || "",
+        "x-iflow-timestamp": String(Date.now()),
+      },
+      body: JSON.stringify(p),
+    });
+    return { text: "ok" };
   }
 }
 

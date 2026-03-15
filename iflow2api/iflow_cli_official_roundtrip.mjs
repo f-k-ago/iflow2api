@@ -76,6 +76,10 @@ function createRuntimeContext({ model, baseUrl }) {
   };
 }
 
+function isPositiveInteger(value) {
+  return Number.isInteger(value) && value > 0;
+}
+
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -132,6 +136,90 @@ function normalizeToolResponseOutput(content) {
     return null;
   }
   return textBlocks.map((block) => block.text).join("");
+}
+
+function shouldCarryStop(stop) {
+  if (Array.isArray(stop)) {
+    return stop.length > 0;
+  }
+  return typeof stop === "string" ? stop.length > 0 : false;
+}
+
+function resolveOutputTokensLimit(requestBody) {
+  if (!requestBody || typeof requestBody !== "object") {
+    return undefined;
+  }
+  if (isPositiveInteger(requestBody.max_completion_tokens)) {
+    return requestBody.max_completion_tokens;
+  }
+  if (isPositiveInteger(requestBody.max_tokens)) {
+    return requestBody.max_tokens;
+  }
+  return undefined;
+}
+
+function resolveThinkingEnabled(requestBody) {
+  if (!requestBody || typeof requestBody !== "object") {
+    return undefined;
+  }
+
+  const thinking = requestBody.thinking;
+  if (thinking && typeof thinking === "object") {
+    if (thinking.enabled === true) {
+      return true;
+    }
+    if (thinking.enabled === false) {
+      return false;
+    }
+    const thinkingType = String(thinking.type || "").trim().toLowerCase();
+    if (thinkingType === "enabled") {
+      return true;
+    }
+    if (thinkingType === "disabled") {
+      return false;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(requestBody, "enable_thinking")) {
+    return Boolean(requestBody.enable_thinking);
+  }
+
+  const templateKwargs = requestBody.chat_template_kwargs;
+  if (
+    templateKwargs &&
+    typeof templateKwargs === "object" &&
+    Object.prototype.hasOwnProperty.call(templateKwargs, "enable_thinking")
+  ) {
+    return Boolean(templateKwargs.enable_thinking);
+  }
+
+  if (requestBody.thinking_mode === true || requestBody.reasoning === true) {
+    return true;
+  }
+
+  return undefined;
+}
+
+function deriveThinkingConfig(requestBody, resolvedMaxTokens) {
+  const thinking = requestBody?.thinking;
+  const requestedMaxTokens = [
+    thinking?.max_tokens,
+    requestBody?.max_tokens,
+    requestBody?.max_completion_tokens,
+    resolvedMaxTokens,
+  ].find(isPositiveInteger);
+  return {
+    maxTokens: requestedMaxTokens ?? resolvedMaxTokens,
+    reasoningLevel:
+      String(
+        thinking?.reasoning_level ??
+          requestBody?.reasoning_level ??
+          requestBody?.reasoningLevel ??
+          "high",
+      )
+        .trim()
+        .toLowerCase() || "high",
+  };
 }
 
 function normalizeAssistantText(content) {
@@ -347,17 +435,20 @@ export class OfficialChatInputValidationError extends Error {
   }
 }
 
-function createOfficialBundleConfig(runtime, context) {
+function createOfficialBundleConfig(runtime, context, options = {}) {
   const sessionId = typeof context?.sessionId === "string" ? context.sessionId : "";
   const conversationId = typeof context?.conversationId === "string" ? context.conversationId : "";
-  const outputTokensLimit = Number.isInteger(context?.outputTokensLimit)
-    ? context.outputTokensLimit
+  const outputTokensLimit = Number.isInteger(options.outputTokensLimit ?? context?.outputTokensLimit)
+    ? (options.outputTokensLimit ?? context?.outputTokensLimit)
     : undefined;
   const contentGeneratorConfig = {
     authType: runtime.authType,
     baseUrl: runtime.baseUrl,
-    multimodalModelName: context?.multimodalModelName || "qwen3-vl-plus",
+    multimodalModelName: context?.multimodalModelName || runtime.model || "qwen3-vl-plus",
   };
+  if (options.thinkingConfig) {
+    contentGeneratorConfig.thinking = options.thinkingConfig;
+  }
   return {
     getModel: () => runtime.model,
     getSessionId: () => sessionId,
@@ -809,5 +900,71 @@ export async function normalizeChatRequestViaOfficialRoundTrip(requestBody, cont
     inputTokens: officialRequest ? await shim.calculateInputTokens(officialRequest) : 0,
     source,
     helpers,
+  };
+}
+
+export async function prepareOfficialBundleExecution(requestBody, context) {
+  const source = requestBody && typeof requestBody === "object" ? requestBody : {};
+  const runtime = createRuntimeContext({ model: source.model, baseUrl: context?.baseUrl });
+  const strictOfficial = context?.strictOfficial !== false;
+  const officialRequest = translateOpenAIMessagesToOfficialRequest(source.messages, runtime);
+  if (!officialRequest && strictOfficial) {
+    throw new OfficialChatInputValidationError(
+      "当前 messages 结构无法严格翻译为官方 iFlow internal request；请改用更标准的 OpenAI chat 消息形状。",
+    );
+  }
+  const officialTools = translateOpenAIToolsToOfficialTools(source.tools);
+  if (officialTools === null && strictOfficial) {
+    throw new OfficialChatInputValidationError(
+      "当前 tools 结构无法严格翻译为官方 iFlow internal tool declarations。",
+    );
+  }
+
+  if (!officialRequest) {
+    throw new OfficialChatInputValidationError("当前请求缺少可翻译的官方 messages 内容。");
+  }
+
+  if (Array.isArray(officialTools) && officialTools.length > 0) {
+    officialRequest.config.tools = officialTools;
+  }
+
+  if (source.temperature !== undefined && source.temperature !== null) {
+    officialRequest.config.temperature = source.temperature;
+  }
+  if (source.top_p !== undefined && source.top_p !== null) {
+    officialRequest.config.topP = source.top_p;
+  }
+  if (shouldCarryStop(source.stop)) {
+    officialRequest.config.stopSequences = source.stop;
+  }
+
+  const helpers = await loadOfficialBundleHelpers();
+  const outputTokensLimit = resolveOutputTokensLimit(source);
+  const thinkingEnabled = resolveThinkingEnabled(source);
+  const thinkingConfig =
+    thinkingEnabled === true ? deriveThinkingConfig(source, outputTokensLimit) : undefined;
+  if (thinkingConfig && !isPositiveInteger(thinkingConfig.maxTokens)) {
+    const fallbackMaxTokens = helpers?.MOt?.(runtime.model, 0, outputTokensLimit);
+    thinkingConfig.maxTokens = isPositiveInteger(fallbackMaxTokens) ? fallbackMaxTokens : 8000;
+  }
+  const config = createOfficialBundleConfig(runtime, context, {
+    outputTokensLimit,
+    thinkingConfig,
+  });
+  const generator = new helpers.gH({
+    model: runtime.model,
+    apiKey: context?.apiKey || "sk-iflow2api-shim",
+    baseUrl: context?.baseUrl || runtime.baseUrl,
+    authType: runtime.authType,
+    debugMode: false,
+    multimodalModelName: config.getContentGeneratorConfig().multimodalModelName,
+    config,
+  });
+
+  return {
+    runtime,
+    officialRequest,
+    helpers,
+    generator,
   };
 }

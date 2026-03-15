@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 
+import { captureOfficialChatCompletionsRequest } from "./iflow_cli_official_capture.mjs";
 import { normalizeChatRequestViaOfficialRoundTrip } from "./iflow_cli_official_roundtrip.mjs";
 
 export const IFLOW_CLI_USER_AGENT = "iFlow-Cli";
@@ -565,40 +566,5 @@ function buildOfficialHeaders({
 }
 
 export async function buildOfficialChatCompletionsRequest(input) {
-  const apiKey = String(input?.apiKey || "");
-  const baseUrl = normalizeBaseUrl(String(input?.baseUrl || ""));
-  const sessionId = String(input?.sessionId || "");
-  const conversationId = String(input?.conversationId || "");
-  const stream = Boolean(input?.stream);
-  const timestampMs = isPositiveInteger(input?.timestampMs) ? input.timestampMs : Date.now();
-  const { body: requestBody, normalizationSource } = await buildOfficialBody({
-    requestBody: input?.requestBody,
-    stream,
-    baseUrl,
-    sessionId,
-    conversationId,
-  });
-
-  const headers = buildOfficialHeaders({
-    apiKey,
-    baseUrl,
-    sessionId,
-    conversationId,
-    traceparent: input?.traceparent,
-    timestampMs,
-  });
-
-  return {
-    url: `${baseUrl}/chat/completions`,
-    headers,
-    body: requestBody,
-    meta: {
-      sessionId,
-      conversationId,
-      traceparent: headers.traceparent || "",
-      timestampMs,
-      scene: resolveScene(baseUrl),
-      normalizationSource,
-    },
-  };
+  return captureOfficialChatCompletionsRequest(input);
 }

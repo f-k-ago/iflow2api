@@ -9,6 +9,21 @@ import { buildOfficialChatCompletionsRequest } from "./iflow_cli_request_builder
 let dispatcherKey = null;
 const activeRequests = new Map();
 
+function redirectConsoleToStderr(method) {
+  return (...args) => {
+    const line = args
+      .map((item) => (typeof item === "string" ? item : String(item)))
+      .join(" ");
+    if (line) {
+      process.stderr.write(`[node-bridge:${method}] ${line}\n`);
+    }
+  };
+}
+
+console.log = redirectConsoleToStderr("log");
+console.info = redirectConsoleToStderr("info");
+console.debug = redirectConsoleToStderr("debug");
+
 async function writeEvent(event) {
   const line = `${JSON.stringify(event)}\n`;
   if (!process.stdout.write(line)) {

@@ -42,6 +42,9 @@ COPY --from=node-deps /node-bridge/package.json /app/package.json
 # 安装运行时依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    tzdata \
+    && ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo Asia/Shanghai > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
 # 从构建阶段复制虚拟环境
@@ -61,6 +64,7 @@ COPY --chown=appuser:appuser . .
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV HOME=/home/appuser
+ENV TZ=Asia/Shanghai
 
 # 暴露端口
 EXPOSE 28000
