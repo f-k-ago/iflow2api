@@ -24,6 +24,10 @@ from .config import load_iflow_config, check_iflow_login, IFlowConfig
 from .messages_adapter import create_anthropic_streaming_response
 from .proxy import IFlowProxy
 from .token_refresher import OAuthTokenRefresher
+from .upstream_diagnostics import (
+    log_upstream_failure,
+    log_upstream_request_context,
+)
 from .vision import (
     get_vision_models_list,
 )
@@ -113,9 +117,26 @@ def _normalize_error_status_code(status_code: object) -> int:
     return 502
 
 
-def _map_upstream_exception(exc: Exception) -> JSONResponse:
+def _map_upstream_exception(
+    exc: Exception,
+    *,
+    lease: Any = None,
+    request_body: Optional[dict[str, Any]] = None,
+    endpoint: str = "unknown",
+    stream: bool = False,
+) -> JSONResponse:
     """将上游异常映射为兼容响应。"""
     status_code, error_msg, error_type = _extract_upstream_error(exc)
+    log_upstream_failure(
+        exc,
+        status_code=status_code,
+        error_msg=error_msg,
+        error_type=error_type,
+        lease=lease,
+        request_body=request_body,
+        endpoint=endpoint,
+        stream=stream,
+    )
     return create_error_response(status_code, error_msg, error_type)
 
 
@@ -730,7 +751,12 @@ async def chat_completions_openai(request: Request):
             except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
                 return _create_openai_busy_response(e)
 
-            logger.debug("分配上游账号: account_id=%s, label=%s", lease.account.id, lease.account.label)
+            log_upstream_request_context(
+                lease,
+                body,
+                endpoint="openai.chat_completions",
+                stream=True,
+            )
 
             try:
                 stream_gen = await lease.proxy.chat_completions(
@@ -740,7 +766,13 @@ async def chat_completions_openai(request: Request):
                 )
             except Exception as e:
                 await lease.close()
-                return _map_upstream_exception(e)
+                return _map_upstream_exception(
+                    e,
+                    lease=lease,
+                    request_body=body,
+                    endpoint="openai.chat_completions",
+                    stream=True,
+                )
 
             async def generate_with_lease():
                 """持有账号租约直到整个流式响应结束。"""
@@ -808,10 +840,21 @@ async def chat_completions_openai(request: Request):
                 return _create_openai_busy_response(e)
 
             try:
-                logger.debug("获取上游非流式响应: account_id=%s", lease.account.id)
+                log_upstream_request_context(
+                    lease,
+                    body,
+                    endpoint="openai.chat_completions",
+                    stream=False,
+                )
                 result = await _run_nonstream_with_lease(lease, body)
             except Exception as e:
-                return _map_upstream_exception(e)
+                return _map_upstream_exception(
+                    e,
+                    lease=lease,
+                    request_body=body,
+                    endpoint="openai.chat_completions",
+                    stream=False,
+                )
             finally:
                 await lease.close()
             # 验证响应包含有效的 choices
@@ -834,7 +877,12 @@ async def chat_completions_openai(request: Request):
     except json.JSONDecodeError as e:
         return create_error_response(400, f"Invalid JSON: {e}", "invalid_request_error")
     except Exception as e:
-        return _map_upstream_exception(e)
+        return _map_upstream_exception(
+            e,
+            request_body=body if "body" in locals() and isinstance(body, dict) else None,
+            endpoint="openai.chat_completions",
+            stream=bool(body.get("stream", False)) if "body" in locals() and isinstance(body, dict) else False,
+        )
 
 
 @app.post(
@@ -993,7 +1041,12 @@ async def messages_anthropic(request: Request):
             except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
                 return _create_anthropic_busy_response(e)
 
-            logger.debug("获取上游流式响应 (Anthropic): account_id=%s", lease.account.id)
+            log_upstream_request_context(
+                lease,
+                openai_body,
+                endpoint="anthropic.messages",
+                stream=True,
+            )
             try:
                 stream_gen = await lease.proxy.chat_completions(
                     openai_body,
@@ -1003,6 +1056,16 @@ async def messages_anthropic(request: Request):
             except Exception as e:
                 await lease.close()
                 status_code, error_msg, error_type = _extract_upstream_error(e)
+                log_upstream_failure(
+                    e,
+                    status_code=status_code,
+                    error_msg=error_msg,
+                    error_type=error_type,
+                    lease=lease,
+                    request_body=openai_body,
+                    endpoint="anthropic.messages",
+                    stream=True,
+                )
                 return JSONResponse(
                     status_code=status_code,
                     content={"type": "error", "error": {"type": error_type, "message": error_msg}},
@@ -1028,8 +1091,29 @@ async def messages_anthropic(request: Request):
                 return _create_anthropic_busy_response(e)
 
             try:
-                logger.debug("获取上游非流式响应 (Anthropic): account_id=%s", lease.account.id)
+                log_upstream_request_context(
+                    lease,
+                    openai_body,
+                    endpoint="anthropic.messages",
+                    stream=False,
+                )
                 openai_result = await _run_nonstream_with_lease(lease, openai_body)
+            except Exception as e:
+                status_code, error_msg, error_type = _extract_upstream_error(e)
+                log_upstream_failure(
+                    e,
+                    status_code=status_code,
+                    error_msg=error_msg,
+                    error_type=error_type,
+                    lease=lease,
+                    request_body=openai_body,
+                    endpoint="anthropic.messages",
+                    stream=False,
+                )
+                return JSONResponse(
+                    status_code=status_code,
+                    content={"type": "error", "error": {"type": error_type, "message": error_msg}},
+                )
             finally:
                 await lease.close()
             logger.debug("收到 OpenAI 格式响应: %s", json.dumps(openai_result, ensure_ascii=False)[:300])
@@ -1082,6 +1166,12 @@ async def root_post(request: Request):
             except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
                 return _create_openai_busy_response(e)
 
+            log_upstream_request_context(
+                lease,
+                body,
+                endpoint="root_post",
+                stream=True,
+            )
             try:
                 stream_gen = await lease.proxy.chat_completions(
                     body,
@@ -1090,7 +1180,13 @@ async def root_post(request: Request):
                 )
             except Exception as e:
                 await lease.close()
-                return _map_upstream_exception(e)
+                return _map_upstream_exception(
+                    e,
+                    lease=lease,
+                    request_body=body,
+                    endpoint="root_post",
+                    stream=True,
+                )
 
             async def generate_with_lease():
                 """持有账号租约直到整个流式传输结束。"""
@@ -1120,10 +1216,21 @@ async def root_post(request: Request):
                 return _create_openai_busy_response(e)
 
             try:
-                logger.debug("获取上游非流式响应 (root_post): account_id=%s", lease.account.id)
+                log_upstream_request_context(
+                    lease,
+                    body,
+                    endpoint="root_post",
+                    stream=False,
+                )
                 result = await _run_nonstream_with_lease(lease, body)
             except Exception as e:
-                return _map_upstream_exception(e)
+                return _map_upstream_exception(
+                    e,
+                    lease=lease,
+                    request_body=body,
+                    endpoint="root_post",
+                    stream=False,
+                )
             finally:
                 await lease.close()
             # 验证响应包含有效的 choices
