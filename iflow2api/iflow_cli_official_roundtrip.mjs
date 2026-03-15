@@ -60,19 +60,35 @@ const OFFICIAL_MULTIMODAL_MODELS = [
   "gpt-4o-mini-0718-Batch",
 ];
 
-const AUTH_IFLOW = "IFLOW";
-const AUTH_AONE = "AONE";
+const AUTH_IFLOW = "iflow";
+const AUTH_AONE = "aone";
+const AUTH_LOGIN_WITH_IFLOW = "oauth-iflow";
+const AUTH_LOGIN_WITH_AONE = "oauth-aone";
 const CLAUDE_MODEL_PATTERN = /claude|haiku|sonnet|opus/i;
 const GPT5_MODEL_PATTERN = /gpt-5/i;
 const TOOL_CALL_PREFIX = "call_";
 
-function createRuntimeContext({ model, baseUrl }) {
+function normalizeOfficialAuthType(authType, normalizedBaseUrl) {
+  const normalizedAuthType = typeof authType === "string" ? authType.trim().toLowerCase() : "";
+  if (normalizedAuthType === AUTH_LOGIN_WITH_AONE || normalizedAuthType === AUTH_AONE) {
+    return normalizedAuthType;
+  }
+  if (normalizedAuthType === AUTH_LOGIN_WITH_IFLOW) {
+    return AUTH_LOGIN_WITH_IFLOW;
+  }
+  if (normalizedAuthType === AUTH_IFLOW || normalizedAuthType === "cookie" || normalizedAuthType === "api-key") {
+    return AUTH_IFLOW;
+  }
+  return normalizedBaseUrl.includes("ducky.code.alibaba-inc.com") ? AUTH_AONE : AUTH_IFLOW;
+}
+
+function createRuntimeContext({ model, baseUrl, authType }) {
   const normalizedModel = typeof model === "string" ? model : "unknown";
   const normalizedBaseUrl = typeof baseUrl === "string" ? baseUrl.trim().toLowerCase() : "";
   return {
     model: normalizedModel,
     baseUrl: normalizedBaseUrl,
-    authType: normalizedBaseUrl.includes("ducky.code.alibaba-inc.com") ? AUTH_AONE : AUTH_IFLOW,
+    authType: normalizeOfficialAuthType(authType, normalizedBaseUrl),
   };
 }
 
@@ -905,7 +921,11 @@ export async function normalizeChatRequestViaOfficialRoundTrip(requestBody, cont
 
 export async function prepareOfficialBundleExecution(requestBody, context) {
   const source = requestBody && typeof requestBody === "object" ? requestBody : {};
-  const runtime = createRuntimeContext({ model: source.model, baseUrl: context?.baseUrl });
+  const runtime = createRuntimeContext({
+    model: source.model,
+    baseUrl: context?.baseUrl,
+    authType: context?.authType,
+  });
   const strictOfficial = context?.strictOfficial !== false;
   const officialRequest = translateOpenAIMessagesToOfficialRequest(source.messages, runtime);
   if (!officialRequest && strictOfficial) {

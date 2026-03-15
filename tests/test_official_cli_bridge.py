@@ -338,6 +338,84 @@ Eao().catch(t=>{console.error("An unexpected critical error occurred:"),t instan
     assert request.meta["normalizationSource"] == "official_bundle"
 
 
+def test_official_bundle_receives_official_auth_type_values(tmp_path, monkeypatch):
+    bundle_path = tmp_path / "iflow.js"
+    bundle_path.write_text(
+        """
+class gH {
+  constructor(options = {}) {
+    this.apiKey = options.apiKey;
+    this.baseUrl = options.baseUrl;
+    this.authType = options.authType;
+    this.config = options.config;
+  }
+  async convertToOpenAIMessages() {
+    return [{ role: "user", content: "shim-user" }];
+  }
+  convertToOpenAITools() {
+    return [];
+  }
+  async calculateInputTokens() {
+    return 1;
+  }
+  async generateContentInternal(e, r, n) {
+    const p = {
+      model: this.config?.getModel?.() || "glm-5",
+      messages: [{ role: "user", content: "shim-user" }],
+      bundle_auth_type: this.authType,
+      bundle_config_auth_type: this.config?.getContentGeneratorConfig?.()?.authType,
+      max_new_tokens: 4242,
+    };
+    await fetch(`${this.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
+        "user-agent": "iFlow-Cli",
+        "session-id": this.config?.getSessionId?.() || "",
+        "conversation-id": this.config?.getConversationId?.() || "",
+        "x-iflow-timestamp": String(Date.now()),
+      },
+      body: JSON.stringify(p),
+    });
+    return { text: "ok" };
+  }
+}
+
+const h2 = {
+  configureThinkingRequest() {
+    return true;
+  },
+  configureNonThinkingRequest() {
+    return true;
+  },
+};
+
+function MOt(model, inputTokens = 0, explicitLimit) {
+  return explicitLimit || 4242;
+}
+
+async function Eao() {}
+Eao().catch(t=>{console.error("An unexpected critical error occurred:"),t instanceof Error?console.error(t.stack):console.error(String(t)),process.exit(1)});
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("IFLOW_OFFICIAL_BUNDLE_PATH", str(bundle_path))
+    monkeypatch.delenv("IFLOW_DISABLE_OFFICIAL_BUNDLE_SHIM", raising=False)
+
+    request = build_request(
+        {
+            "model": "glm-5",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        authType="oauth-iflow",
+    )
+
+    assert request.body["bundle_auth_type"] == "oauth-iflow"
+    assert request.body["bundle_config_auth_type"] == "oauth-iflow"
+
+
 def test_official_bundle_is_now_required(monkeypatch):
     monkeypatch.delenv("IFLOW_OFFICIAL_BUNDLE_PATH", raising=False)
     monkeypatch.setenv("IFLOW_DISABLE_OFFICIAL_BUNDLE_SHIM", "1")

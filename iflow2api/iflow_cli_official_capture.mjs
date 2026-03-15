@@ -71,6 +71,7 @@ export async function captureOfficialChatCompletionsRequest(input) {
   const { generator, officialRequest } = await prepareOfficialBundleExecution(requestBody, {
     apiKey: payload.apiKey,
     baseUrl: payload.baseUrl,
+    authType: payload.authType,
     sessionId: payload.sessionId,
     conversationId: payload.conversationId,
     strictOfficial: true,

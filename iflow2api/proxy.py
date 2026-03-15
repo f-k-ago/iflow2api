@@ -555,6 +555,7 @@ class IFlowProxy:
         return {
             "apiKey": self.config.api_key,
             "baseUrl": self.base_url,
+            "authType": (self.config.auth_type or "").strip(),
             "sessionId": self._session_id,
             "conversationId": self._conversation_id,
             "traceparent": (traceparent or "").strip(),
