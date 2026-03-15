@@ -38,6 +38,8 @@ WORKDIR /official-iflow
 RUN npm pack "@iflow-ai/iflow-cli@${IFLOW_CLI_PACKAGE_VERSION}" --pack-destination /tmp \
     && mkdir -p /official-iflow/package \
     && tar -xzf /tmp/*.tgz -C /official-iflow \
+    && cd /official-iflow/package \
+    && npm install --omit=dev --ignore-scripts --no-audit --no-fund \
     && test -f /official-iflow/package/bundle/iflow.js
 
 # 阶段2: 运行阶段
@@ -47,7 +49,7 @@ FROM python:3.12-slim
 COPY --from=node:24.14.0-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=node-deps /node-bridge/node_modules /app/node_modules
 COPY --from=node-deps /node-bridge/package.json /app/package.json
-COPY --from=official-bundle /official-iflow/package/bundle/iflow.js /opt/iflow-official/package/bundle/iflow.js
+COPY --from=official-bundle /official-iflow/package /opt/iflow-official/package
 
 # 安装运行时依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \

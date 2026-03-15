@@ -11,7 +11,7 @@ cd iflow2api
 docker compose up -d
 ```
 
-镜像现在会在构建阶段内置一份与当前项目对齐版本的官方 `iflow-cli` bundle，并自动设置：
+镜像现在会在构建阶段内置一份与当前项目对齐版本的官方 `iflow-cli` bundle **及其运行时依赖**，并自动设置：
 
 ```text
 IFLOW_OFFICIAL_BUNDLE_PATH=/opt/iflow-official/package/bundle/iflow.js

@@ -10,9 +10,8 @@ const DEFAULT_BUNDLE_CANDIDATES = [
   fileURLToPath(new URL("../../../package/bundle/iflow.js", import.meta.url)),
 ];
 
-const MAIN_ENTRY_NEEDLE = `Eao().catch(t => {
-    console.error("An unexpected critical error occurred:"), t instanceof Error ? console.error(t.stack) : console.error(String(t)), process.exit(1)
-});`;
+const MAIN_ENTRY_PATTERN =
+  /Eao\(\)\.catch\(t\s*=>\s*\{\s*console\.error\("An unexpected critical error occurred:"\)\s*,\s*t\s+instanceof\s+Error\s*\?\s*console\.error\(t\.stack\)\s*:\s*console\.error\(String\(t\)\)\s*,\s*process\.exit\(1\)\s*\}\s*\);?/;
 
 let cachedHelpersPromise = null;
 
@@ -55,12 +54,14 @@ async function firstExistingBundlePath() {
 }
 
 function patchOfficialBundleSource(sourceText) {
-  if (!sourceText.includes(MAIN_ENTRY_NEEDLE)) {
+  const mainEntryMatch = sourceText.match(MAIN_ENTRY_PATTERN);
+  if (!mainEntryMatch) {
     throw new Error("官方 bundle 顶层入口锚点未命中，无法生成 patched shim");
   }
-  const patchedMain = `if (!globalThis.${SUPPRESS_MAIN_FLAG}) {\n${MAIN_ENTRY_NEEDLE}\n}`;
+  const mainEntry = mainEntryMatch[0];
+  const patchedMain = `if (!globalThis.${SUPPRESS_MAIN_FLAG}) {\n${mainEntry}\n}`;
   const exportFooter = `\nexport { ${OFFICIAL_EXPORTS.join(", ")} };\n`;
-  return sourceText.replace(MAIN_ENTRY_NEEDLE, patchedMain) + exportFooter;
+  return sourceText.replace(mainEntry, patchedMain) + exportFooter;
 }
 
 async function ensurePatchedShim(bundlePath) {

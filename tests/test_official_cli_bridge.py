@@ -317,9 +317,7 @@ function MOt(model, inputTokens = 0, explicitLimit) {
 }
 
 async function Eao() {}
-Eao().catch(t => {
-    console.error("An unexpected critical error occurred:"), t instanceof Error ? console.error(t.stack) : console.error(String(t)), process.exit(1)
-});
+Eao().catch(t=>{console.error("An unexpected critical error occurred:"),t instanceof Error?console.error(t.stack):console.error(String(t)),process.exit(1)});
 """.strip(),
         encoding="utf-8",
     )
