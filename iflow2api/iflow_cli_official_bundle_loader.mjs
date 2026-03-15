@@ -12,6 +12,8 @@ const DEFAULT_BUNDLE_CANDIDATES = [
 
 const MAIN_ENTRY_PATTERN =
   /Eao\(\)\.catch\(t\s*=>\s*\{\s*console\.error\("An unexpected critical error occurred:"\)\s*,\s*t\s+instanceof\s+Error\s*\?\s*console\.error\(t\.stack\)\s*:\s*console\.error\(String\(t\)\)\s*,\s*process\.exit\(1\)\s*\}\s*\);?/;
+const IFLOW_OAUTH_APIKEY_OVERRIDE_PATTERN =
+  /if\s*\(\s*\(this\.authType\s*===\s*Wt\.LOGIN_WITH_IFLOW\s*\|\|\s*this\.authType\s*===\s*Wt\.IFLOW\s*\)\s*&&\s*await\s*fte\(\)\s*\)\s*\{\s*this\.authType\s*===\s*Wt\.LOGIN_WITH_IFLOW\s*&&\s*await\s*MOe\(\)\s*;\s*let\s*\{\s*getCachedApiKey:\s*[A-Za-z_$][\w$]*\s*\}\s*=\s*await\s*Promise\.resolve\(\)\.then\(\(\)\s*=>\s*\(vB\(\)\s*,\s*gEt\)\)\s*,\s*[A-Za-z_$][\w$]*\s*=\s*await\s*[A-Za-z_$][\w$]*\(\)\s*;\s*[A-Za-z_$][\w$]*\s*&&\s*\(this\.apiKey\s*=\s*[A-Za-z_$][\w$]*\)\s*\}/;
 
 let cachedHelpersPromise = null;
 
@@ -60,8 +62,21 @@ function patchOfficialBundleSource(sourceText) {
   }
   const mainEntry = mainEntryMatch[0];
   const patchedMain = `if (!globalThis.${SUPPRESS_MAIN_FLAG}) {\n${mainEntry}\n}`;
+  const maybeHasOAuthOverrideMarkers =
+    sourceText.includes("getCachedApiKey")
+    && sourceText.includes("this.authType === Wt.LOGIN_WITH_IFLOW")
+    && sourceText.includes("await fte()");
+  if (maybeHasOAuthOverrideMarkers && !IFLOW_OAUTH_APIKEY_OVERRIDE_PATTERN.test(sourceText)) {
+    throw new Error("官方 bundle OAuth apiKey 覆盖锚点未命中，无法安全禁用本地缓存覆盖");
+  }
+  const patchedSource = IFLOW_OAUTH_APIKEY_OVERRIDE_PATTERN.test(sourceText)
+    ? sourceText.replace(
+        IFLOW_OAUTH_APIKEY_OVERRIDE_PATTERN,
+        "/* iflow2api: disabled official local oauth apiKey override */",
+      )
+    : sourceText;
   const exportFooter = `\nexport { ${OFFICIAL_EXPORTS.join(", ")} };\n`;
-  return sourceText.replace(mainEntry, patchedMain) + exportFooter;
+  return patchedSource.replace(mainEntry, patchedMain) + exportFooter;
 }
 
 async function ensurePatchedShim(bundlePath) {
