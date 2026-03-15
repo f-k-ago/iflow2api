@@ -31,6 +31,15 @@ WORKDIR /node-bridge
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
+# 阶段1c: 下载官方 iflow-cli bundle，供 strict official parity 使用
+FROM node:24.14.0-slim AS official-bundle
+ARG IFLOW_CLI_PACKAGE_VERSION=0.5.17-beta-20260313
+WORKDIR /official-iflow
+RUN npm pack "@iflow-ai/iflow-cli@${IFLOW_CLI_PACKAGE_VERSION}" --pack-destination /tmp \
+    && mkdir -p /official-iflow/package \
+    && tar -xzf /tmp/*.tgz -C /official-iflow \
+    && test -f /official-iflow/package/bundle/iflow.js
+
 # 阶段2: 运行阶段
 FROM python:3.12-slim
 
@@ -38,6 +47,7 @@ FROM python:3.12-slim
 COPY --from=node:24.14.0-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=node-deps /node-bridge/node_modules /app/node_modules
 COPY --from=node-deps /node-bridge/package.json /app/package.json
+COPY --from=official-bundle /official-iflow/package/bundle/iflow.js /opt/iflow-official/package/bundle/iflow.js
 
 # 安装运行时依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -65,6 +75,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV HOME=/home/appuser
 ENV TZ=Asia/Shanghai
+ENV IFLOW_OFFICIAL_BUNDLE_PATH=/opt/iflow-official/package/bundle/iflow.js
 
 # 暴露端口
 EXPOSE 28000

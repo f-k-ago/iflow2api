@@ -84,7 +84,7 @@ export async function loadOfficialBundleHelpers() {
       const bundlePath = await firstExistingBundlePath();
       if (!bundlePath) {
         throw createOfficialBundleRequiredError(
-          "当前已强制要求 patched 官方 bundle，但未找到可用的 package/bundle/iflow.js。",
+          "当前已强制要求 patched 官方 bundle，但未找到可用的 package/bundle/iflow.js。请设置 IFLOW_OFFICIAL_BUNDLE_PATH，或使用已内置官方 bundle 的 Docker 镜像。",
         );
       }
       const { shimPath, digest } = await ensurePatchedShim(bundlePath);

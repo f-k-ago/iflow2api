@@ -11,6 +11,14 @@ cd iflow2api
 docker compose up -d
 ```
 
+镜像现在会在构建阶段内置一份与当前项目对齐版本的官方 `iflow-cli` bundle，并自动设置：
+
+```text
+IFLOW_OFFICIAL_BUNDLE_PATH=/opt/iflow-official/package/bundle/iflow.js
+```
+
+因此 Docker 部署默认可直接满足 strict official parity 模式。
+
 ## 访问地址
 
 - 管理界面：`http://localhost:28000/admin`
@@ -88,6 +96,25 @@ docker compose up -d --force-recreate
 
 ```bash
 docker compose logs --tail=200
+```
+
+如果日志里出现：
+
+```text
+当前已强制要求 patched 官方 bundle，但未找到可用的 package/bundle/iflow.js
+```
+
+说明当前运行环境没有拿到官方 bundle。对 Docker 部署，这通常意味着你还在使用旧镜像；执行一次：
+
+```bash
+docker compose pull
+docker compose up -d --force-recreate
+```
+
+如果是非 Docker 自部署，请显式设置：
+
+```bash
+export IFLOW_OFFICIAL_BUNDLE_PATH=/绝对路径/package/bundle/iflow.js
 ```
 
 ### 端口冲突
