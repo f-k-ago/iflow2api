@@ -17,6 +17,7 @@ import urllib.parse
 from typing import Any, AsyncIterator, Literal, Optional, overload
 from .config import IFlowConfig
 from .official_cli_bridge import OfficialIFlowCLITransport
+from .request_identity import strip_legacy_generated_request_ids
 from .tracing import get_current_traceparent, session_trace_context, span_context
 from .transport import BaseUpstreamTransport, create_upstream_transport
 
@@ -182,9 +183,11 @@ class IFlowProxy:
         self._client: Optional[BaseUpstreamTransport] = None
         self._official_cli_bridge: Optional[OfficialIFlowCLITransport] = None
 
-        # 优先复用账号持久化的 session / conversation id，降低漂移。
-        self._session_id = (config.session_id or "").strip() or f"session-{uuid.uuid4()}"
-        self._conversation_id = (config.conversation_id or "").strip() or str(uuid.uuid4())
+        # 官方请求主链读取配置里的 session / conversation id；没有就保持空字符串。
+        self._session_id, self._conversation_id, _ = strip_legacy_generated_request_ids(
+            config.session_id,
+            config.conversation_id,
+        )
         self._telemetry_user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, config.api_key or self._session_id))
 
     @staticmethod

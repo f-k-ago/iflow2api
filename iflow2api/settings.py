@@ -10,6 +10,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from .crypto import ConfigEncryption
+from .request_identity import strip_legacy_generated_request_ids
 
 logger = logging.getLogger("iflow2api")
 
@@ -60,16 +61,13 @@ def _normalize_account(account: UpstreamAccount) -> UpstreamAccount:
     account.cookie_email = (account.cookie_email or "").strip()
     account.email = (account.email or "").strip()
     account.phone = (account.phone or "").strip()
-    account.session_id = (account.session_id or "").strip()
-    account.conversation_id = (account.conversation_id or "").strip()
+    account.session_id, account.conversation_id, _ = strip_legacy_generated_request_ids(
+        account.session_id,
+        account.conversation_id,
+    )
 
     if account.auth_type == "cookie" and not account.email and account.cookie_email:
         account.email = account.cookie_email
-
-    if not account.session_id:
-        account.session_id = f"session-{uuid4()}"
-    if not account.conversation_id:
-        account.conversation_id = str(uuid4())
 
     if not account.created_at:
         account.created_at = _now_iso()
@@ -408,6 +406,7 @@ def load_settings() -> AppSettings:
     settings = AppSettings()
     migrated_legacy_transport_backend = False
     removed_unsupported_accounts = 0
+    cleared_legacy_request_ids = False
 
     # 首先从 ~/.iflow2api/config.json 加载所有设置（包括 api_key）
     app_config_path = get_config_path()
@@ -433,6 +432,17 @@ def load_settings() -> AppSettings:
                         if not isinstance(raw_account, dict):
                             continue
                         account_data: dict[str, Any] = dict(raw_account)
+                        (
+                            account_data["session_id"],
+                            account_data["conversation_id"],
+                            legacy_request_ids_cleared,
+                        ) = strip_legacy_generated_request_ids(
+                            account_data.get("session_id"),
+                            account_data.get("conversation_id"),
+                        )
+                        cleared_legacy_request_ids = (
+                            cleared_legacy_request_ids or legacy_request_ids_cleared
+                        )
                         if "oauth_access_token" in account_data:
                             account_data["oauth_access_token"] = _decrypt_token(account_data["oauth_access_token"])
                         if "oauth_refresh_token" in account_data:
@@ -498,6 +508,8 @@ def load_settings() -> AppSettings:
     removed_unsupported_accounts = prune_unsupported_upstream_accounts(settings)
     if removed_unsupported_accounts:
         logger.info("检测到并清理了 %d 个已废弃的 API Key 上游账号", removed_unsupported_accounts)
+    if cleared_legacy_request_ids:
+        logger.info("检测到旧版自动生成的 session/conversation id，已回退为空字符串以对齐官方 iFlow CLI")
 
     if (settings.base_url or DEFAULT_BASE_URL).rstrip("/") == DEFAULT_BASE_URL and settings.upstream_transport_backend in {
         "httpx",
@@ -513,7 +525,7 @@ def load_settings() -> AppSettings:
     if settings.upstream_accounts:
         sync_legacy_auth_fields(settings)
 
-    if migrated_legacy_transport_backend or removed_unsupported_accounts:
+    if migrated_legacy_transport_backend or removed_unsupported_accounts or cleared_legacy_request_ids:
         try:
             save_settings(settings)
         except Exception as persist_error:
