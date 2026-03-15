@@ -96,6 +96,14 @@ class UpstreamAPIError(Exception):
         self.payload = payload
 
 
+def build_upstream_body_preview(raw_text: str, *, limit: int = 300) -> str:
+    """压缩空白并截断上游响应体，便于日志诊断。"""
+    if not raw_text:
+        return ""
+    collapsed = re.sub(r"\s+", " ", raw_text).strip()
+    return collapsed[:limit]
+
+
 def parse_upstream_business_error(payload: Any) -> UpstreamAPIError | None:
     """识别 iflow 上游在 HTTP 200 中返回的业务错误包。"""
     if not isinstance(payload, dict):
@@ -971,6 +979,8 @@ class IFlowProxy:
                             completed_successfully = False
                             upstream_status_code: int | None = None
                             upstream_content_type = "unknown"
+                            upstream_body_preview = ""
+                            saw_non_sse_response = False
                             bridge_payload = self._build_official_chat_request_payload(
                                 request_body,
                                 stream=True,
@@ -1000,9 +1010,11 @@ class IFlowProxy:
                                     # 如果上游没有返回 SSE 流（可能是 JSON 错误），读取并处理
                                     if "text/event-stream" not in upstream_content_type and "application/octet-stream" not in upstream_content_type:
                                         # 上游返回了非流式响应（可能是错误）
+                                        saw_non_sse_response = True
                                         raw_body = await response.aread()
                                         body_str = raw_body.decode("utf-8", errors="replace")
-                                        logger.debug("上游非流式响应体: %s", body_str[:500])
+                                        upstream_body_preview = build_upstream_body_preview(body_str)
+                                        logger.debug("上游非流式响应体: %s", upstream_body_preview)
                                         try:
                                             error_data = json.loads(body_str)
                                             upstream_error = parse_upstream_business_error(error_data)
@@ -1091,12 +1103,18 @@ class IFlowProxy:
                                 raise
                             finally:
                                 if chunk_count == 0:
-                                    logger.warning(
-                                        "上游流式响应为空 (0 chunks): model=%s, status=%s, content-type=%s",
+                                    warning_message = "上游流式响应为空 (0 chunks): model=%s, status=%s, content-type=%s"
+                                    warning_args: list[Any] = [
                                         model,
                                         upstream_status_code if upstream_status_code is not None else "unknown",
                                         upstream_content_type,
-                                    )
+                                    ]
+                                    if saw_non_sse_response:
+                                        warning_message = "上游流式请求返回非 SSE 响应: model=%s, status=%s, content-type=%s"
+                                    if upstream_body_preview:
+                                        warning_message += ", body-preview=%s"
+                                        warning_args.append(upstream_body_preview)
+                                    logger.warning(warning_message, *warning_args)
                                 else:
                                     logger.debug("流式完成: 共 %d chunks", chunk_count)
                                 if completed_successfully and telemetry_session.parent_observation_id:
