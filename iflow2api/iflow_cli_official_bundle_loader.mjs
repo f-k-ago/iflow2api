@@ -16,6 +16,13 @@ const MAIN_ENTRY_NEEDLE = `Eao().catch(t => {
 
 let cachedHelpersPromise = null;
 
+function createOfficialBundleRequiredError(message) {
+  const error = new Error(message);
+  error.name = "OfficialBundleRequiredError";
+  error.code = "official_bundle_required";
+  return error;
+}
+
 function normalizeBundlePath(value) {
   if (typeof value !== "string") {
     return "";
@@ -76,7 +83,9 @@ export async function loadOfficialBundleHelpers() {
     cachedHelpersPromise = (async () => {
       const bundlePath = await firstExistingBundlePath();
       if (!bundlePath) {
-        return null;
+        throw createOfficialBundleRequiredError(
+          "当前已强制要求 patched 官方 bundle，但未找到可用的 package/bundle/iflow.js。",
+        );
       }
       const { shimPath, digest } = await ensurePatchedShim(bundlePath);
       globalThis[SUPPRESS_MAIN_FLAG] = true;
@@ -91,13 +100,14 @@ export async function loadOfficialBundleHelpers() {
         shimPath,
         source: "official_bundle",
       };
-    })().catch((error) => {
-      cachedHelpersPromise = Promise.resolve(null);
-      console.warn("[iflow2api] failed to load patched official bundle shim:", error?.message || String(error));
-      return null;
-    });
+    })();
   }
-  return cachedHelpersPromise;
+  try {
+    return await cachedHelpersPromise;
+  } catch (error) {
+    cachedHelpersPromise = null;
+    throw error;
+  }
 }
 
 export function resetOfficialBundleHelpersForTests() {

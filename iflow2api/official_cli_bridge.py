@@ -30,11 +30,22 @@ class OfficialBuilderValidationError(NodeFetchBridgeError):
         self.error_type = "invalid_request_error"
 
 
+class OfficialBundleRequiredError(NodeFetchBridgeError):
+    """当前部署缺少可用的官方 bundle。"""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.status_code = 503
+        self.error_type = "service_unavailable"
+
+
 def _raise_bridge_error(event: dict[str, Any], default_message: str) -> None:
     message = str(event.get("message") or default_message)
     code = str(event.get("code") or "").strip()
     if code == "invalid_request_error":
         raise OfficialBuilderValidationError(message)
+    if code == "official_bundle_required":
+        raise OfficialBundleRequiredError(message)
     raise NodeFetchBridgeError(message)
 
 

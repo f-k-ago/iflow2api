@@ -4,6 +4,7 @@ import pytest
 
 from iflow2api.official_cli_bridge import (
     OfficialBuilderValidationError,
+    OfficialBundleRequiredError,
     OfficialIFlowCLITransport,
 )
 
@@ -312,3 +313,18 @@ Eao().catch(t => {
     assert request.body["bundle_nonthinking"] is True
     assert request.body["max_new_tokens"] == 4242
     assert request.meta["normalizationSource"] == "official_bundle"
+
+
+def test_official_bundle_is_now_required(monkeypatch):
+    monkeypatch.delenv("IFLOW_OFFICIAL_BUNDLE_PATH", raising=False)
+    monkeypatch.setenv("IFLOW_DISABLE_OFFICIAL_BUNDLE_SHIM", "1")
+
+    with pytest.raises(OfficialBundleRequiredError) as exc_info:
+        build_request(
+            {
+                "model": "glm-5",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert "强制要求 patched 官方 bundle" in str(exc_info.value)

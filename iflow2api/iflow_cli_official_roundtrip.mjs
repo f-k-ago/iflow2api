@@ -779,17 +779,10 @@ class OfficialRoundTripShim {
 
 async function createRoundTripShim(runtime, context) {
   const helpers = await loadOfficialBundleHelpers();
-  if (helpers?.gH && helpers?.MOt && helpers?.h2) {
-    return {
-      shim: new OfficialBundleRoundTripShim(runtime, context, helpers),
-      helpers,
-      source: helpers.source,
-    };
-  }
   return {
-    shim: new OfficialRoundTripShim(runtime),
-    helpers: null,
-    source: "local_fallback",
+    shim: new OfficialBundleRoundTripShim(runtime, context, helpers),
+    helpers,
+    source: helpers.source,
   };
 }
 
