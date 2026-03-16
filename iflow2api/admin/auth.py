@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import time
@@ -12,10 +13,14 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+logger = logging.getLogger("iflow2api")
+
 # PBKDF2 哈希参数
 _PBKDF2_ITERATIONS = 260000  # OWASP 2023 推荐值
 _PBKDF2_HASH = "sha256"
 _HASH_PREFIX = "pbkdf2:"  # 用于区分新旧格式
+ADMIN_SESSION_COOKIE_NAME = "iflow2api_admin_session"
+ADMIN_SESSION_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
 class AdminUser(BaseModel):
@@ -40,6 +45,8 @@ class AuthManager:
         self._users: dict[str, AdminUser] = {}
         self._active_tokens: dict[str, TokenData] = {}
         self._config_path = Path.home() / ".iflow2api" / "admin_users.json"
+        self._load_failed = False
+        self._load_error = ""
         # JWT secret 单独存储，与用户数据分离
         self._jwt_secret_path = Path.home() / ".iflow2api" / ".jwt_secret"
         self._jwt_secret = self._load_or_create_jwt_secret()
@@ -66,6 +73,8 @@ class AuthManager:
 
     def _load_users(self) -> None:
         """加载用户数据"""
+        self._load_failed = False
+        self._load_error = ""
         if self._config_path.exists():
             try:
                 with open(self._config_path, "r", encoding="utf-8") as f:
@@ -88,8 +97,11 @@ class AuthManager:
                         except Exception:
                             pass
                         self._jwt_secret = secret
-            except Exception:
-                pass
+            except Exception as exc:
+                self._users.clear()
+                self._load_failed = True
+                self._load_error = str(exc)
+                logger.error("管理员用户文件加载失败: %s", exc)
 
     def _save_users(self) -> None:
         """保存用户数据（不包含 JWT secret，避免敏感信息共存）"""
@@ -266,6 +278,18 @@ class AuthManager:
     def has_users(self) -> bool:
         """检查是否有用户"""
         return len(self._users) > 0
+
+    def has_load_error(self) -> bool:
+        """用户配置是否加载失败。"""
+        return self._load_failed
+
+    def get_load_error(self) -> str:
+        """返回加载失败原因。"""
+        return self._load_error
+
+    def get_signing_secret(self) -> str:
+        """返回当前认证体系使用的签名密钥。"""
+        return self._jwt_secret
 
 
 def create_access_token(username: str, secret: str) -> str:

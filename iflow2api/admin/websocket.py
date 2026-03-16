@@ -1,7 +1,6 @@
 """WebSocket 连接管理器 - 实时状态推送"""
 
 import asyncio
-import json
 from datetime import datetime
 from typing import Any, Optional
 
@@ -18,6 +17,10 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket) -> None:
         """接受新连接"""
         await websocket.accept()
+        await self.register(websocket)
+
+    async def register(self, websocket: WebSocket) -> None:
+        """登记一个已经完成 accept 的连接。"""
         async with self._lock:
             self._connections.append(websocket)
 

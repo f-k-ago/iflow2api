@@ -2,6 +2,9 @@
 
 import json
 import logging
+import os
+import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -13,6 +16,7 @@ from .crypto import ConfigEncryption
 from .request_identity import normalize_request_ids
 
 logger = logging.getLogger("iflow2api")
+_settings_file_lock = threading.RLock()
 
 
 DEFAULT_BASE_URL = "https://apis.iflow.cn/v1"
@@ -136,7 +140,7 @@ class AppSettings(BaseModel):
     # - 流式请求：主动取消后立即释放令牌
     # - 非流式请求：主动取消后需等待运行完毕才释放令牌
     enable_concurrency_limit: bool = True
-    max_concurrent_requests: int = 1
+    max_concurrent_requests: int = Field(default=1, ge=1, le=10)
     max_queued_requests: int = Field(default=100, ge=0, le=10000)
 
     # 兼容旧配置的遗留字段，运行时不再使用
@@ -401,7 +405,7 @@ def get_config_path() -> Path:
     return get_config_dir() / "config.json"
 
 
-def load_settings() -> AppSettings:
+def _load_settings_unlocked() -> AppSettings:
     """加载配置"""
     settings = AppSettings()
     migrated_legacy_transport_backend = False
@@ -457,6 +461,10 @@ def load_settings() -> AppSettings:
                 if "preserve_reasoning_content" in data:
                     settings.preserve_reasoning_content = data["preserve_reasoning_content"]
                 # 上游 API 并发设置
+                if "enable_concurrency_limit" in data:
+                    settings.enable_concurrency_limit = data["enable_concurrency_limit"]
+                if "max_concurrent_requests" in data:
+                    settings.max_concurrent_requests = data["max_concurrent_requests"]
                 if "api_concurrency" in data:
                     settings.api_concurrency = data["api_concurrency"]
                 if "max_queued_requests" in data:
@@ -526,7 +534,13 @@ def load_settings() -> AppSettings:
     return settings
 
 
-def save_settings(settings: AppSettings) -> None:
+def load_settings() -> AppSettings:
+    """线程安全地加载配置。"""
+    with _settings_file_lock:
+        return _load_settings_unlocked()
+
+
+def _save_settings_unlocked(settings: AppSettings) -> None:
     """
     保存配置
 
@@ -567,6 +581,8 @@ def save_settings(settings: AppSettings) -> None:
         # 思考链设置
         "preserve_reasoning_content": settings.preserve_reasoning_content,
         # 上游 API 并发设置
+        "enable_concurrency_limit": settings.enable_concurrency_limit,
+        "max_concurrent_requests": settings.max_concurrent_requests,
         "api_concurrency": settings.api_concurrency,
         "max_queued_requests": settings.max_queued_requests,
         # 语言设置
@@ -586,5 +602,35 @@ def save_settings(settings: AppSettings) -> None:
     }
 
     config_path = get_config_path()
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(app_data, f, indent=2, ensure_ascii=False)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f"{config_path.name}.",
+        suffix=".tmp",
+        dir=str(config_dir),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(app_data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, config_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def save_settings(settings: AppSettings) -> None:
+    """线程安全地保存配置。"""
+    with _settings_file_lock:
+        _save_settings_unlocked(settings)
+
+
+def mutate_settings(mutator) -> Any:
+    """在同一把锁内完成 load → mutate → save，降低并发覆盖风险。"""
+    with _settings_file_lock:
+        settings = _load_settings_unlocked()
+        result = mutator(settings)
+        _save_settings_unlocked(settings)
+        return result

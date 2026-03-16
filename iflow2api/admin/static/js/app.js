@@ -7,11 +7,13 @@ const API_BASE = '/admin';
 
 // 全局状态
 const state = {
-    token: localStorage.getItem('admin_token'),
     currentUser: null,
     ws: null,
     settings: {},
     refreshInterval: null,
+    wsShouldReconnect: false,
+    oauthWindow: null,
+    pendingOAuthState: null,
 };
 
 // ==================== 工具函数 ====================
@@ -42,14 +44,11 @@ async function apiRequest(endpoint, options = {}) {
         ...options.headers,
     };
 
-    if (state.token) {
-        headers['Authorization'] = `Bearer ${state.token}`;
-    }
-
     try {
         const response = await fetch(url, {
             ...options,
             headers,
+            credentials: 'same-origin',
         });
 
         const data = await response.json();
@@ -163,19 +162,12 @@ function renderUpstreamAccounts(accounts, tableId, includeActions = false) {
  * 检查登录状态
  */
 async function checkAuth() {
-    if (!state.token) {
-        showLoginPage();
-        return false;
-    }
-
     try {
-        // 获取状态来验证 token
+        // 获取状态来验证会话 Cookie
         await apiRequest('/status');
         showMainPage();
         return true;
     } catch (error) {
-        localStorage.removeItem('admin_token');
-        state.token = null;
         showLoginPage();
         return false;
     }
@@ -188,7 +180,9 @@ async function checkSetup() {
     try {
         const data = await apiRequest('/check-setup');
         const hint = document.getElementById('login-hint');
-        if (data.needs_setup) {
+        if (data.load_error) {
+            hint.textContent = data.message || '管理员用户配置加载失败，请联系管理员检查服务端配置';
+        } else if (data.needs_setup) {
             hint.textContent = '首次使用，请设置管理员账户';
         } else {
             hint.textContent = '';
@@ -208,8 +202,6 @@ async function login(username, password) {
             body: JSON.stringify({ username, password }),
         });
 
-        state.token = data.token;
-        localStorage.setItem('admin_token', data.token);
         state.currentUser = username;
 
         showToast(data.message, 'success');
@@ -229,9 +221,8 @@ async function logout() {
         console.error('Logout error:', error);
     }
 
-    localStorage.removeItem('admin_token');
-    state.token = null;
     state.currentUser = null;
+    state.wsShouldReconnect = false;
 
     if (state.ws) {
         state.ws.close();
@@ -502,6 +493,7 @@ async function oauthLogin() {
         // 获取 OAuth URL
         const data = await apiRequest('/oauth/url');
         const authUrl = data.auth_url;
+        state.pendingOAuthState = data.state || null;
         
         // 打开新窗口进行 OAuth 登录
         const width = 600;
@@ -514,6 +506,7 @@ async function oauthLogin() {
             'iFlow OAuth',
             `width=${width},height=${height},left=${left},top=${top},toolbar=no,menubar=no`
         );
+        state.oauthWindow = oauthWindow;
 
         if (!oauthWindow) {
             showToast('浏览器拦截了 OAuth 登录窗口，请允许弹窗后重试', 'error');
@@ -529,7 +522,17 @@ async function oauthLogin() {
         
         // 创建新的 OAuth 回调消息监听器
         _oauthMessageHandler = async (event) => {
+            if (event.origin !== window.location.origin) {
+                return;
+            }
+            if (state.oauthWindow && event.source !== state.oauthWindow) {
+                return;
+            }
             if (event.data && event.data.type === 'oauth_callback') {
+                if (state.pendingOAuthState && event.data.state !== state.pendingOAuthState) {
+                    showToast('OAuth state 校验失败，请重新登录', 'error');
+                    return;
+                }
                 const code = event.data.code;
                 if (code) {
                     try {
@@ -538,6 +541,7 @@ async function oauthLogin() {
                             body: JSON.stringify({ code, state: event.data.state || null }),
                         });
                         showToast(result.message, 'success');
+                        state.pendingOAuthState = null;
                         loadSettings();
                         loadAccountInfo();
                     } catch (error) {
@@ -547,6 +551,7 @@ async function oauthLogin() {
                 // 处理完成后移除监听器
                 window.removeEventListener('message', _oauthMessageHandler);
                 _oauthMessageHandler = null;
+                state.oauthWindow = null;
             }
         };
         
@@ -572,6 +577,8 @@ async function submitOAuthCallbackUrl() {
             body: JSON.stringify({ redirect_url: callbackUrl }),
         });
         showToast(result.message || 'OAuth 登录成功', 'success');
+        state.pendingOAuthState = null;
+        state.oauthWindow = null;
         callbackUrlInput.value = '';
         loadSettings();
         loadAccountInfo();
@@ -633,14 +640,26 @@ async function loadUsers() {
 
         users.forEach(user => {
             const tr = document.createElement('tr');
-            tr.innerHTML = `
-                <td>${user.username}</td>
-                <td>${formatDateTime(user.created_at)}</td>
-                <td>${formatDateTime(user.last_login)}</td>
-                <td>
-                    <button class="btn btn-danger btn-sm" onclick="deleteUser('${user.username}')">删除</button>
-                </td>
-            `;
+            const usernameCell = document.createElement('td');
+            usernameCell.textContent = user.username;
+
+            const createdAtCell = document.createElement('td');
+            createdAtCell.textContent = formatDateTime(user.created_at);
+
+            const lastLoginCell = document.createElement('td');
+            lastLoginCell.textContent = formatDateTime(user.last_login);
+
+            const actionCell = document.createElement('td');
+            const deleteButton = document.createElement('button');
+            deleteButton.className = 'btn btn-danger btn-sm';
+            deleteButton.textContent = '删除';
+            deleteButton.addEventListener('click', () => deleteUser(user.username));
+            actionCell.appendChild(deleteButton);
+
+            tr.appendChild(usernameCell);
+            tr.appendChild(createdAtCell);
+            tr.appendChild(lastLoginCell);
+            tr.appendChild(actionCell);
             tbody.appendChild(tr);
         });
     } catch (error) {
@@ -716,18 +735,18 @@ async function loadLogs() {
 
 function connectWebSocket() {
     if (state.ws) {
+        state.wsShouldReconnect = false;
         state.ws.close();
     }
 
     const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // 在 URL 中添加 token 查询参数（后端要求在握手阶段验证）
-    const wsUrl = `${wsProtocol}//${location.host}${API_BASE}/ws?token=${encodeURIComponent(state.token)}`;
+    const wsUrl = `${wsProtocol}//${location.host}${API_BASE}/ws`;
 
     state.ws = new WebSocket(wsUrl);
+    state.wsShouldReconnect = true;
 
     state.ws.onopen = () => {
         console.log('WebSocket connected');
-        // 连接已通过 URL 参数认证，无需再发送 auth 消息
     };
 
     state.ws.onmessage = (event) => {
@@ -735,10 +754,17 @@ function connectWebSocket() {
         handleWebSocketMessage(data);
     };
 
-    state.ws.onclose = () => {
+    state.ws.onclose = (event) => {
         console.log('WebSocket disconnected');
-        // 5秒后重连
-        setTimeout(connectWebSocket, 5000);
+        if (event.code === 4001) {
+            state.wsShouldReconnect = false;
+            showLoginPage();
+            showToast('登录状态已失效，请重新登录', 'error');
+            return;
+        }
+        if (state.wsShouldReconnect) {
+            setTimeout(connectWebSocket, 5000);
+        }
     };
 
     state.ws.onerror = (error) => {

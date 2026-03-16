@@ -1,18 +1,27 @@
 """Web 管理界面路由"""
+import asyncio
+import json
 import platform
-import secrets
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
-from .auth import get_auth_manager
+from ..proxy import mask_proxy_url
+from .auth import (
+    ADMIN_SESSION_MAX_AGE_SECONDS,
+    ADMIN_SESSION_COOKIE_NAME,
+    get_auth_manager,
+)
+from .oauth_state import OAuthStateManager
 from .websocket import get_connection_manager
 
 
@@ -21,6 +30,7 @@ admin_router = APIRouter(prefix="/admin", tags=["Admin"])
 
 # HTTP Bearer 认证方案
 security = HTTPBearer(auto_error=False)
+_OAUTH_STATE_TTL_SECONDS = 10 * 60
 
 
 # 请求/响应模型
@@ -44,12 +54,16 @@ class CreateUserRequest(BaseModel):
 
 class SettingsUpdate(BaseModel):
     """设置更新请求"""
+    model_config = ConfigDict(extra="forbid")
+
     host: Optional[str] = None
-    port: Optional[int] = None
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
     oauth_callback_base_url: Optional[str] = None
     theme_mode: Optional[str] = None
     preserve_reasoning_content: Optional[bool] = None
-    max_queued_requests: Optional[int] = None
+    enable_concurrency_limit: Optional[bool] = None
+    max_concurrent_requests: Optional[int] = Field(default=None, ge=1, le=10)
+    max_queued_requests: Optional[int] = Field(default=None, ge=0, le=10000)
     language: Optional[str] = None
     custom_api_key: Optional[str] = None
     custom_auth_header: Optional[str] = None
@@ -76,16 +90,98 @@ class UpstreamAccountToggleRequest(BaseModel):
     enabled: bool
 
 
+def _get_oauth_state_manager() -> OAuthStateManager:
+    """获取 OAuth state 管理器。"""
+    auth_manager = get_auth_manager()
+    return OAuthStateManager(
+        auth_manager.get_signing_secret(),
+        ttl_seconds=_OAUTH_STATE_TTL_SECONDS,
+    )
+
+
+def _safe_json_for_html_script(value: dict[str, Any]) -> str:
+    """把 JSON 安全嵌入 HTML script，避免 `</script>` 打断上下文。"""
+    return (
+        json.dumps(value, ensure_ascii=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
+def _mask_secret_value(value: str, *, keep_prefix: int = 4, keep_suffix: int = 4) -> str:
+    """脱敏敏感字符串，仅保留少量首尾字符用于辨认。"""
+    raw = str(value or "")
+    if not raw:
+        return ""
+    visible = max(0, keep_prefix) + max(0, keep_suffix)
+    if len(raw) <= visible:
+        return "*" * len(raw)
+    masked_len = max(4, len(raw) - visible)
+    return f"{raw[:keep_prefix]}{'*' * masked_len}{raw[-keep_suffix:]}"
+
+
+def _restore_secret_if_masked(current_value: str, submitted_value: str, *, masker) -> str:
+    """如果前端回传的是当前脱敏展示值，则保留原始秘密。"""
+    if current_value and submitted_value == masker(current_value):
+        return current_value
+    return submitted_value
+
+
+def _is_request_secure(request: Request) -> bool:
+    """判断请求是否处于 HTTPS 上下文。"""
+    forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip()
+    if forwarded_proto:
+        return forwarded_proto == "https"
+    return request.url.scheme == "https"
+
+
+def _set_admin_session_cookie(response: JSONResponse, request: Request, token: str) -> None:
+    """写入管理端会话 Cookie。"""
+    response.set_cookie(
+        key=ADMIN_SESSION_COOKIE_NAME,
+        value=token,
+        max_age=ADMIN_SESSION_MAX_AGE_SECONDS,
+        httponly=True,
+        secure=_is_request_secure(request),
+        samesite="lax",
+        path="/admin",
+    )
+
+
+def _clear_admin_session_cookie(response: JSONResponse, request: Request) -> None:
+    """清除管理端会话 Cookie。"""
+    response.delete_cookie(
+        key=ADMIN_SESSION_COOKIE_NAME,
+        httponly=True,
+        secure=_is_request_secure(request),
+        samesite="lax",
+        path="/admin",
+    )
+
+
+def _extract_admin_token(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials],
+) -> str:
+    """从 Bearer 或 Cookie 中提取管理端令牌。"""
+    if credentials is not None:
+        return str(credentials.credentials or "").strip()
+    return str(request.cookies.get(ADMIN_SESSION_COOKIE_NAME) or "").strip()
+
+
 # 认证依赖
 async def get_current_user(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> str:
     """获取当前认证用户"""
-    if credentials is None:
+    token = _extract_admin_token(request, credentials)
+    if not token:
         raise HTTPException(status_code=401, detail="未提供认证令牌")
     
     auth_manager = get_auth_manager()
-    username = auth_manager.verify_token(credentials.credentials)
+    username = auth_manager.verify_token(token)
     
     if username is None:
         raise HTTPException(status_code=401, detail="无效或过期的令牌")
@@ -96,43 +192,57 @@ async def get_current_user(
 # ==================== 认证相关 ====================
 
 @admin_router.post("/login")
-async def login(request: LoginRequest) -> dict[str, Any]:
+async def login(request: LoginRequest, fastapi_request: Request) -> JSONResponse:
     """用户登录"""
     auth_manager = get_auth_manager()
+
+    if auth_manager.has_load_error():
+        raise HTTPException(
+            status_code=503,
+            detail=f"管理员用户配置加载失败，请先修复用户文件: {auth_manager.get_load_error()}",
+        )
     
     # 如果没有用户，创建第一个用户
     if not auth_manager.has_users():
         auth_manager.create_user(request.username, request.password)
         token = auth_manager.authenticate(request.username, request.password)
-        return {
+        response = JSONResponse(content={
             "success": True,
             "token": token,
             "message": "首次登录，已创建管理员账户",
             "is_first_login": True,
-        }
+        })
+        _set_admin_session_cookie(response, fastapi_request, token)
+        return response
     
     token = auth_manager.authenticate(request.username, request.password)
     if token is None:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
-    
-    return {
+
+    response = JSONResponse(content={
         "success": True,
         "token": token,
         "message": "登录成功",
         "is_first_login": False,
-    }
+    })
+    _set_admin_session_cookie(response, fastapi_request, token)
+    return response
 
 
 @admin_router.post("/logout")
 async def logout(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-) -> dict[str, Any]:
+) -> JSONResponse:
     """用户登出"""
-    if credentials:
+    token = _extract_admin_token(request, credentials)
+    if token:
         auth_manager = get_auth_manager()
-        auth_manager.logout(credentials.credentials)
-    
-    return {"success": True, "message": "已登出"}
+        auth_manager.logout(token)
+
+    response = JSONResponse(content={"success": True, "message": "已登出"})
+    _clear_admin_session_cookie(response, request)
+    return response
 
 
 @admin_router.post("/change-password")
@@ -154,9 +264,17 @@ async def change_password(
 async def check_setup() -> dict[str, Any]:
     """检查是否需要初始化设置"""
     auth_manager = get_auth_manager()
+    if auth_manager.has_load_error():
+        return {
+            "needs_setup": False,
+            "has_users": True,
+            "load_error": True,
+            "message": "管理员用户配置加载失败，请检查用户文件",
+        }
     return {
         "needs_setup": not auth_manager.has_users(),
         "has_users": auth_manager.has_users(),
+        "load_error": False,
     }
 
 
@@ -359,6 +477,38 @@ def _find_upstream_account(settings, account_id: str):
     return None
 
 
+def _toggle_upstream_account_for_request(settings, account_id: str, enabled: bool) -> bool:
+    """在锁内切换上游账号状态。"""
+    account = _find_upstream_account(settings, account_id)
+    if account is None:
+        return False
+    account.enabled = enabled
+    return True
+
+
+def _remove_upstream_account_for_request(
+    settings,
+    account_id: str,
+    *,
+    default_base_url: str,
+    remove_upstream_account,
+) -> bool:
+    """在锁内删除上游账号。"""
+    if not settings.upstream_accounts and account_id == "legacy-primary":
+        settings.api_key = ""
+        settings.base_url = default_base_url
+        settings.auth_type = ""
+        settings.oauth_access_token = ""
+        settings.oauth_refresh_token = ""
+        settings.oauth_expires_at = None
+        settings.cookie = ""
+        settings.cookie_email = ""
+        settings.cookie_expires_at = None
+        return True
+
+    return remove_upstream_account(settings, account_id)
+
+
 @admin_router.get("/account-info")
 async def get_account_info(username: str = Depends(get_current_user)) -> dict[str, Any]:
     """获取账号池概览与兼容代表账号信息。"""
@@ -411,12 +561,16 @@ async def get_settings(username: str = Depends(get_current_user)) -> dict[str, A
         "oauth_callback_base_url": settings.oauth_callback_base_url,
         "theme_mode": settings.theme_mode,
         "preserve_reasoning_content": settings.preserve_reasoning_content,
+        "enable_concurrency_limit": settings.enable_concurrency_limit,
+        "max_concurrent_requests": settings.max_concurrent_requests,
         "max_queued_requests": settings.max_queued_requests,
         "language": settings.language,
-        "custom_api_key": settings.custom_api_key,
+        "custom_api_key": _mask_secret_value(settings.custom_api_key),
+        "custom_api_key_configured": bool(settings.custom_api_key),
         "custom_auth_header": settings.custom_auth_header,
         # 上游代理设置
-        "upstream_proxy": settings.upstream_proxy,
+        "upstream_proxy": mask_proxy_url(settings.upstream_proxy),
+        "upstream_proxy_configured": bool(settings.upstream_proxy),
         "upstream_proxy_enabled": settings.upstream_proxy_enabled,
         # 不返回 OAuth 敏感信息
     }
@@ -428,37 +582,46 @@ async def update_settings(
     username: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """更新应用设置"""
-    from ..settings import load_settings, save_settings
+    from ..settings import mutate_settings
 
-    settings = load_settings()
-    
-    # 更新设置
-    if request.host is not None:
-        settings.host = request.host
-    if request.port is not None:
-        settings.port = request.port
-    if request.oauth_callback_base_url is not None:
-        settings.oauth_callback_base_url = request.oauth_callback_base_url.strip()
-    if request.theme_mode is not None:
-        settings.theme_mode = request.theme_mode
-    if request.preserve_reasoning_content is not None:
-        settings.preserve_reasoning_content = request.preserve_reasoning_content
-    if request.max_queued_requests is not None:
-        settings.max_queued_requests = request.max_queued_requests
-    if request.language is not None:
-        settings.language = request.language
-    if request.custom_api_key is not None:
-        settings.custom_api_key = request.custom_api_key
-    if request.custom_auth_header is not None:
-        settings.custom_auth_header = request.custom_auth_header
-    # 上游代理设置
-    if request.upstream_proxy is not None:
-        settings.upstream_proxy = request.upstream_proxy
-    if request.upstream_proxy_enabled is not None:
-        settings.upstream_proxy_enabled = request.upstream_proxy_enabled
+    def _apply(settings) -> None:
+        if request.host is not None:
+            settings.host = request.host
+        if request.port is not None:
+            settings.port = request.port
+        if request.oauth_callback_base_url is not None:
+            settings.oauth_callback_base_url = request.oauth_callback_base_url.strip()
+        if request.theme_mode is not None:
+            settings.theme_mode = request.theme_mode
+        if request.preserve_reasoning_content is not None:
+            settings.preserve_reasoning_content = request.preserve_reasoning_content
+        if request.enable_concurrency_limit is not None:
+            settings.enable_concurrency_limit = request.enable_concurrency_limit
+        if request.max_concurrent_requests is not None:
+            settings.max_concurrent_requests = request.max_concurrent_requests
+        if request.max_queued_requests is not None:
+            settings.max_queued_requests = request.max_queued_requests
+        if request.language is not None:
+            settings.language = request.language
+        if request.custom_api_key is not None:
+            settings.custom_api_key = _restore_secret_if_masked(
+                settings.custom_api_key,
+                request.custom_api_key,
+                masker=_mask_secret_value,
+            )
+        if request.custom_auth_header is not None:
+            settings.custom_auth_header = request.custom_auth_header
+        if request.upstream_proxy is not None:
+            settings.upstream_proxy = _restore_secret_if_masked(
+                settings.upstream_proxy,
+                request.upstream_proxy,
+                masker=mask_proxy_url,
+            )
+        if request.upstream_proxy_enabled is not None:
+            settings.upstream_proxy_enabled = request.upstream_proxy_enabled
 
-    save_settings(settings)
-    
+    mutate_settings(_apply)
+
     # 广播设置变更
     connection_manager = get_connection_manager()
     await connection_manager.broadcast({
@@ -466,8 +629,9 @@ async def update_settings(
         "timestamp": datetime.now().isoformat(),
     })
 
-    from ..app import reload_proxy
+    from ..app import invalidate_settings_cache, reload_proxy
 
+    invalidate_settings_cache()
     reload_proxy()
     
     return {"success": True, "message": "设置已保存"}
@@ -497,13 +661,16 @@ async def toggle_upstream_account(
     username: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """启用或停用上游账号。"""
-    from ..settings import load_settings, save_settings
+    from ..settings import mutate_settings
 
-    settings = load_settings()
-    account = _find_upstream_account(settings, account_id)
-    if account is not None:
-        account.enabled = request.enabled
-        save_settings(settings)
+    updated = mutate_settings(
+        lambda settings: _toggle_upstream_account_for_request(
+            settings,
+            account_id,
+            request.enabled,
+        )
+    )
+    if updated:
         from ..app import reload_proxy
 
         reload_proxy()
@@ -574,29 +741,18 @@ async def delete_upstream_account(
     username: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """删除上游账号。"""
-    from ..settings import DEFAULT_BASE_URL, load_settings, remove_upstream_account, save_settings
+    from ..settings import DEFAULT_BASE_URL, mutate_settings, remove_upstream_account
 
-    settings = load_settings()
-    if not settings.upstream_accounts and account_id == "legacy-primary":
-        settings.api_key = ""
-        settings.base_url = DEFAULT_BASE_URL
-        settings.auth_type = ""
-        settings.oauth_access_token = ""
-        settings.oauth_refresh_token = ""
-        settings.oauth_expires_at = None
-        settings.cookie = ""
-        settings.cookie_email = ""
-        settings.cookie_expires_at = None
-        save_settings(settings)
-        from ..app import reload_proxy
-
-        reload_proxy()
-        return {"success": True, "message": "账号已删除"}
-
-    if not remove_upstream_account(settings, account_id):
+    removed = mutate_settings(
+        lambda settings: _remove_upstream_account_for_request(
+            settings,
+            account_id,
+            default_base_url=DEFAULT_BASE_URL,
+            remove_upstream_account=remove_upstream_account,
+        )
+    )
+    if not removed:
         raise HTTPException(status_code=404, detail="账号不存在")
-
-    save_settings(settings)
 
     from ..app import reload_proxy
 
@@ -616,7 +772,7 @@ async def get_oauth_url(
     oauth = IFlowOAuth()
     redirect_uri = _build_oauth_redirect_uri(request, settings.oauth_callback_base_url)
 
-    state = secrets.token_urlsafe(16)
+    state = _get_oauth_state_manager().issue(username)
     auth_url = oauth.get_auth_url(redirect_uri=redirect_uri, state=state)
 
     return {
@@ -635,6 +791,13 @@ async def oauth_callback_get(code: str, state: Optional[str] = None):
     """
     from fastapi.responses import HTMLResponse
     
+    callback_payload = _safe_json_for_html_script(
+        {
+            "type": "oauth_callback",
+            "code": code,
+            "state": state or "",
+        }
+    )
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -680,11 +843,8 @@ async def oauth_callback_get(code: str, state: Optional[str] = None):
         <script>
             // 将授权码发送回父窗口
             if (window.opener) {{
-                window.opener.postMessage({{
-                    type: 'oauth_callback',
-                    code: '{code}',
-                    state: '{state or ''}'
-                }}, '*');
+                const payload = {callback_payload};
+                window.opener.postMessage(payload, window.location.origin);
                 // 关闭当前窗口
                 setTimeout(function() {{
                     window.close();
@@ -709,7 +869,7 @@ async def cookie_login(
 ) -> dict[str, Any]:
     """使用 BXAuth Cookie 登录"""
     from ..oauth import IFlowOAuth
-    from ..settings import UpstreamAccount, load_settings, save_settings, upsert_upstream_account
+    from ..settings import UpstreamAccount, load_settings, mutate_settings, upsert_upstream_account
 
     oauth = IFlowOAuth()
 
@@ -727,19 +887,19 @@ async def cookie_login(
                 "message": "获取 API Key 失败"
             }
 
-        settings = load_settings()
         account = UpstreamAccount(
             label=resolved_email.strip() or "Cookie 账号",
             auth_type="cookie",
             api_key=api_key,
-            base_url=settings.base_url,
+            base_url=load_settings().base_url,
             cookie=IFlowOAuth.cookie_for_storage(request.cookie),
             cookie_email=resolved_email.strip(),
             cookie_expires_at=expired or None,
             email=resolved_email.strip(),
         )
-        saved_account = upsert_upstream_account(settings, account)
-        save_settings(settings)
+        saved_account = mutate_settings(
+            lambda settings: upsert_upstream_account(settings, account)
+        )
 
         # 重新加载代理实例
         from ..app import reload_proxy
@@ -775,7 +935,7 @@ async def oauth_callback(
 ) -> dict[str, Any]:
     """处理 OAuth 回调（POST 请求 - 从前端发送）"""
     from ..oauth import IFlowOAuth
-    from ..settings import UpstreamAccount, load_settings, save_settings, upsert_upstream_account
+    from ..settings import UpstreamAccount, load_settings, mutate_settings, upsert_upstream_account
 
     settings = load_settings()
     oauth = IFlowOAuth()
@@ -787,6 +947,10 @@ async def oauth_callback(
 
     if not callback_code:
         raise HTTPException(status_code=400, detail="OAuth 回调缺少授权码")
+    if not callback_state:
+        raise HTTPException(status_code=400, detail="OAuth 回调缺少 state")
+    if not _get_oauth_state_manager().consume(username, callback_state):
+        raise HTTPException(status_code=400, detail="OAuth state 无效或已过期，请重新发起登录")
 
     # 构建回调地址（必须与获取 auth_url 时一致）
     redirect_uri = _build_oauth_redirect_uri(fastapi_request, settings.oauth_callback_base_url)
@@ -806,7 +970,6 @@ async def oauth_callback(
         if not api_key:
             raise HTTPException(status_code=400, detail="无法获取 API Key")
         
-        settings = load_settings()
         account = UpstreamAccount(
             label=(user_info.get("email") or user_info.get("phone") or "OAuth 账号").strip(),
             auth_type="oauth-iflow",
@@ -818,8 +981,9 @@ async def oauth_callback(
             email=(user_info.get("email") or "").strip(),
             phone=(user_info.get("phone") or "").strip(),
         )
-        saved_account = upsert_upstream_account(settings, account)
-        save_settings(settings)
+        saved_account = mutate_settings(
+            lambda current_settings: upsert_upstream_account(current_settings, account)
+        )
 
         # 重新加载代理实例
         from ..app import reload_proxy
@@ -828,7 +992,6 @@ async def oauth_callback(
         return {
             "success": True,
             "message": "登录成功！配置已自动更新",
-            "api_key": api_key,
             "account_id": saved_account.id,
             "state": callback_state,
         }
@@ -840,7 +1003,7 @@ async def oauth_callback(
 
 @admin_router.get("/logs")
 async def get_logs(
-    lines: int = 100,
+    lines: int = Query(default=100, ge=1, le=1000),
     username: str = Depends(get_current_user),
 ) -> dict[str, Any]:
     """获取日志"""
@@ -850,13 +1013,16 @@ async def get_logs(
         return {"logs": [], "message": "日志文件不存在"}
     
     try:
-        with open(log_path, "r", encoding="utf-8") as f:
-            all_lines = f.readlines()
-            recent_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+        total_lines = 0
+        recent_lines: deque[str] = deque(maxlen=lines)
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                total_lines += 1
+                recent_lines.append(line)
         
         return {
             "logs": [line.strip() for line in recent_lines],
-            "total_lines": len(all_lines),
+            "total_lines": total_lines,
         }
     except Exception as e:
         return {"logs": [], "error": str(e)}
@@ -866,21 +1032,43 @@ async def get_logs(
 
 @admin_router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket 连接端点（M-10 修复：连接建立时即验证 Token）"""
-    # 在 HTTP Upgrade 阶段验证 token（来自查询参数）
-    token = websocket.query_params.get("token")
-    if not token:
-        await websocket.close(code=4001, reason="Missing token")
-        return
+    """WebSocket 连接端点。"""
+    query_token = str(websocket.query_params.get("token") or "").strip()
+    cookie_token = str(websocket.cookies.get(ADMIN_SESSION_COOKIE_NAME) or "").strip()
 
     auth_manager = get_auth_manager()
-    username = auth_manager.verify_token(token)
-    if not username:
-        await websocket.close(code=4001, reason="Invalid or expired token")
-        return
-
     connection_manager = get_connection_manager()
-    await connection_manager.connect(websocket)
+    username: Optional[str] = None
+
+    token = query_token or cookie_token
+    if token:
+        username = auth_manager.verify_token(token)
+        if not username:
+            await websocket.close(code=4001, reason="Invalid or expired token")
+            return
+        await connection_manager.connect(websocket)
+    else:
+        await websocket.accept()
+        try:
+            data = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
+        except Exception:
+            await websocket.close(code=4001, reason="Missing token")
+            return
+
+        if data.get("type") != "auth":
+            await websocket.close(code=4001, reason="Missing auth message")
+            return
+
+        auth_token = str(data.get("token") or "").strip()
+        username = auth_manager.verify_token(auth_token)
+        if not username:
+            await websocket.close(code=4001, reason="Invalid or expired token")
+            return
+        await connection_manager.register(websocket)
+        await connection_manager.send_personal(websocket, {
+            "type": "auth_success",
+            "username": username,
+        })
 
     try:
         while True:

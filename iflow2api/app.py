@@ -7,7 +7,7 @@ import os as _os
 import asyncio
 import time
 from contextlib import asynccontextmanager, suppress
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,7 +21,7 @@ from .anthropic_compat import (
     openai_to_anthropic_response,
 )
 from .config import load_iflow_config, check_iflow_login, IFlowConfig
-from .messages_adapter import create_anthropic_streaming_response
+from .messages_adapter import create_anthropic_error_response, create_anthropic_streaming_response
 from .proxy import IFlowProxy
 from .token_refresher import OAuthTokenRefresher
 from .upstream_diagnostics import (
@@ -56,6 +56,7 @@ def reload_proxy() -> None:
         asyncio.create_task(_proxy.close())
     _proxy = None
     _config = None
+    invalidate_settings_cache()
 
 
 def get_proxy() -> IFlowProxy:
@@ -160,16 +161,146 @@ def _create_openai_busy_response(exc: BaseException) -> JSONResponse:
 
 def _create_anthropic_busy_response(exc: BaseException) -> JSONResponse:
     """返回 Anthropic 兼容的 429 忙碌响应。"""
-    return JSONResponse(
-        status_code=429,
-        content={
-            "type": "error",
-            "error": {
-                "type": "rate_limit_exceeded",
-                "message": _get_upstream_busy_message(exc),
-            },
-        },
+    return _create_anthropic_error_response(429, _get_upstream_busy_message(exc), "rate_limit_exceeded")
+
+
+def _normalize_anthropic_error_type(status_code: int, error_type: str) -> str:
+    """将内部/OpenAI 风格错误类型映射为 Anthropic 风格。"""
+    normalized_type = str(error_type or "").strip() or "api_error"
+    if normalized_type == "rate_limit_exceeded":
+        return "rate_limit_error"
+    if normalized_type in {
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "request_too_large",
+        "rate_limit_error",
+        "api_error",
+        "overloaded_error",
+    }:
+        return normalized_type
+
+    if status_code == 429:
+        return "rate_limit_error"
+    if status_code == 413:
+        return "request_too_large"
+    if status_code == 404:
+        return "not_found_error"
+    if status_code == 403:
+        return "permission_error"
+    if status_code == 401:
+        return "authentication_error"
+    if status_code == 400:
+        return "invalid_request_error"
+    if status_code == 529:
+        return "overloaded_error"
+    return normalized_type
+
+
+def _create_anthropic_error_response(
+    status_code: int,
+    message: str,
+    error_type: str = "api_error",
+) -> JSONResponse:
+    """创建 Anthropic 兼容错误响应。"""
+    normalized_status_code = _normalize_error_status_code(status_code)
+    return create_anthropic_error_response(
+        normalized_status_code,
+        message,
+        _normalize_anthropic_error_type(normalized_status_code, error_type),
     )
+
+
+def _map_anthropic_exception(
+    exc: Exception,
+    *,
+    lease: Any = None,
+    request_body: Optional[dict[str, Any]] = None,
+    endpoint: str = "unknown",
+    stream: bool = False,
+) -> JSONResponse:
+    """将上游异常映射为 Anthropic 兼容错误响应。"""
+    status_code, error_msg, error_type = _extract_upstream_error(exc)
+    log_upstream_failure(
+        exc,
+        status_code=status_code,
+        error_msg=error_msg,
+        error_type=error_type,
+        lease=lease,
+        request_body=request_body,
+        endpoint=endpoint,
+        stream=stream,
+    )
+    return _create_anthropic_error_response(status_code, error_msg, error_type)
+
+
+async def _empty_async_iterator() -> AsyncIterator[str | bytes]:
+    """返回一个空的异步迭代器。"""
+    if False:  # pragma: no cover
+        yield b""
+
+
+async def _prime_stream_generator(
+    stream_gen: AsyncIterator[str | bytes],
+) -> tuple[str | bytes | None, AsyncIterator[str | bytes]]:
+    """预取流式响应首块，便于在发送响应头前暴露上游错误。"""
+    iterator = stream_gen.__aiter__()
+    try:
+        first_chunk = await anext(iterator)
+    except StopAsyncIteration:
+        return None, _empty_async_iterator()
+
+    async def chained() -> AsyncIterator[str | bytes]:
+        yield first_chunk
+        async for chunk in iterator:
+            yield chunk
+
+    return first_chunk, chained()
+
+
+def _observe_stream_generator_errors(
+    stream_gen: AsyncIterator[str | bytes],
+    *,
+    lease: Any,
+    request_body: dict[str, Any],
+    endpoint: str,
+    stream: bool,
+) -> AsyncIterator[str | bytes]:
+    """包装流式生成器，在中途异常时输出统一诊断日志。"""
+
+    async def observed() -> AsyncIterator[str | bytes]:
+        chunk_count = 0
+        try:
+            async for chunk in stream_gen:
+                chunk_count += 1
+                yield chunk
+        except Exception as exc:
+            status_code, error_msg, error_type = _extract_upstream_error(exc)
+            log_upstream_failure(
+                exc,
+                status_code=status_code,
+                error_msg=error_msg,
+                error_type=error_type,
+                lease=lease,
+                request_body=request_body,
+                endpoint=endpoint,
+                stream=stream,
+                phase="midstream",
+                chunk_count=chunk_count,
+            )
+            raise
+
+    return observed()
+
+
+def _is_done_sse_chunk(chunk: str | bytes) -> bool:
+    """判断 SSE 数据块是否为终止标记。"""
+    if isinstance(chunk, bytes):
+        text = chunk.decode("utf-8", errors="replace")
+    else:
+        text = str(chunk)
+    return text.strip() in {"data: [DONE]", "data:[DONE]"}
 
 
 async def _run_nonstream_with_lease(lease, request_body: dict) -> dict:
@@ -311,11 +442,19 @@ _MAX_REQUEST_BODY_SIZE = 10 * 1024 * 1024  # 10 MB（H-07 修复）
 async def limit_request_body(request: Request, call_next):
     """拒绝超大请求体，防止内存耗尽 DoS（H-07 修复）"""
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > _MAX_REQUEST_BODY_SIZE:
-        return JSONResponse(
-            status_code=413,
-            content={"error": {"message": "Request body too large", "type": "invalid_request_error"}},
-        )
+    if content_length:
+        try:
+            parsed_content_length = int(content_length)
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": "Invalid Content-Length header", "type": "invalid_request_error"}},
+            )
+        if parsed_content_length > _MAX_REQUEST_BODY_SIZE:
+            return JSONResponse(
+                status_code=413,
+                content={"error": {"message": "Request body too large", "type": "invalid_request_error"}},
+            )
     return await call_next(request)
 
 
@@ -324,6 +463,12 @@ async def limit_request_body(request: Request, call_next):
 # 简单内存缓存，减少每次请求读磁盘（H-08 修复）
 _settings_cache: dict = {"data": None, "ts": 0.0}
 _SETTINGS_CACHE_TTL = 5.0  # 5 秒内复用缓存
+
+
+def invalidate_settings_cache() -> None:
+    """主动清空设置缓存，确保敏感配置变更立即生效。"""
+    _settings_cache["data"] = None
+    _settings_cache["ts"] = 0.0
 
 
 def _get_cached_settings():
@@ -433,7 +578,10 @@ async def log_requests(request: Request, call_next):
     if request.method in ("POST", "PUT", "PATCH"):
         content_length = request.headers.get("content-length")
         if content_length:
-            body_size = int(content_length)
+            try:
+                body_size = int(content_length)
+            except ValueError:
+                body_size = 0
     
     # 格式化请求体大小
     def format_size(size: int) -> str:
@@ -633,6 +781,50 @@ def create_error_response(status_code: int, message: str, error_type: str = "api
     )
 
 
+_ANTHROPIC_BLOCK_TYPES = {"image", "tool_use", "tool_result"}
+
+
+def _looks_like_anthropic_messages_request(body: dict[str, Any]) -> bool:
+    """基于请求体特征判断是否更像 Anthropic Messages 请求。"""
+    if not isinstance(body, dict):
+        return False
+
+    if any(key in body for key in ("system", "stop_sequences", "anthropic_version")):
+        return True
+
+    model = str(body.get("model") or "").strip().lower()
+    if model.startswith("claude"):
+        return True
+
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and "input_schema" in tool:
+                return True
+
+    tool_choice = body.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        tool_choice_type = str(tool_choice.get("type") or "").strip().lower()
+        if tool_choice_type in {"any", "tool"}:
+            return True
+        if tool_choice_type == "auto" and "function" not in tool_choice:
+            return True
+
+    for message in body.get("messages", []):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "").strip().lower() in _ANTHROPIC_BLOCK_TYPES:
+                return True
+
+    return False
+
+
 @app.post(
     "/v1/chat/completions",
     summary="Chat Completions API (OpenAI 格式)",
@@ -773,53 +965,72 @@ async def chat_completions_openai(request: Request):
                     endpoint="openai.chat_completions",
                     stream=True,
                 )
+            try:
+                first_chunk, stream_gen = await _prime_stream_generator(stream_gen)
+            except Exception as e:
+                await lease.close()
+                return _map_upstream_exception(
+                    e,
+                    lease=lease,
+                    request_body=body,
+                    endpoint="openai.chat_completions",
+                    stream=True,
+                )
+            if first_chunk is None:
+                await lease.close()
+                logger.warning(
+                    "上游流式响应为空 (首块为空): account=%s, label=%s, model=%s",
+                    lease.account.id,
+                    lease.account.label,
+                    model,
+                )
+                return create_error_response(502, "上游流式响应为空", "api_error")
 
             async def generate_with_lease():
                 """持有账号租约直到整个流式响应结束。"""
                 chunk_count = 0
-                cancelled = False
+                saw_done = False
+                stream_failed = False
                 try:
                     async for chunk in stream_gen:
                         chunk_count += 1
+                        if _is_done_sse_chunk(chunk):
+                            saw_done = True
                         if chunk_count <= 3:
                             logger.debug("流式chunk[%d]: %s", chunk_count, chunk[:200])
                         yield chunk
                 except asyncio.CancelledError:
-                    cancelled = True
                     logger.info("客户端取消流式请求，立即释放账号令牌: %s", lease.account.id)
                     raise
                 except Exception as e:
+                    stream_failed = True
+                    status_code, error_msg, error_type = _extract_upstream_error(e)
+                    log_upstream_failure(
+                        e,
+                        status_code=status_code,
+                        error_msg=error_msg,
+                        error_type=error_type,
+                        lease=lease,
+                        request_body=body,
+                        endpoint="openai.chat_completions",
+                        stream=True,
+                        phase="midstream",
+                        chunk_count=chunk_count,
+                    )
                     logger.error("Streaming error after %d chunks: %s", chunk_count, e)
                 else:
-                    if chunk_count > 0:
+                    if chunk_count > 0 and not saw_done:
                         yield b"data: [DONE]\n\n"
                 finally:
-                    logger.debug("流式完成: account=%s, chunks=%d", lease.account.id, chunk_count)
-                    if not cancelled and chunk_count == 0:
+                    if stream_failed and chunk_count > 0 and not saw_done:
                         logger.warning(
-                            "生成错误回退响应 (0 chunks from upstream): account=%s, label=%s, model=%s",
+                            "OpenAI 流式中途异常，补发 [DONE] 终止标记: account=%s, chunks=%d, model=%s",
                             lease.account.id,
-                            lease.account.label,
+                            chunk_count,
                             model,
                         )
-                        import time as _time
-
-                        fallback = {
-                            "id": f"fallback-{int(_time.time())}",
-                            "object": "chat.completion.chunk",
-                            "created": int(_time.time()),
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                    "content": "上游流式响应为空（0 chunks）。这通常是上游未返回任何 SSE 数据，常见于上下文超限、模型侧异常或上游代理吞流，请查看服务端日志。"
-                                },
-                                "finish_reason": "stop"
-                            }]
-                        }
-                        yield ("data: " + json.dumps(fallback, ensure_ascii=False) + "\n\n").encode("utf-8")
                         yield b"data: [DONE]\n\n"
+                    logger.debug("流式完成: account=%s, chunks=%d", lease.account.id, chunk_count)
                     await lease.close()
 
             return StreamingResponse(
@@ -1012,10 +1223,7 @@ async def messages_anthropic(request: Request):
         body_bytes = await request.body()
         body = json.loads(body_bytes.decode("utf-8"))
         if "messages" not in body:
-            return JSONResponse(
-                status_code=422,
-                content={"type": "error", "error": {"type": "invalid_request_error", "message": "Field 'messages' is required"}}
-            )
+            return _create_anthropic_error_response(422, "Field 'messages' is required", "invalid_request_error")
         stream = body.get("stream", False)
         original_model = body.get("model", "unknown")
         
@@ -1034,10 +1242,7 @@ async def messages_anthropic(request: Request):
             try:
                 lease = await _acquire_upstream_lease()
             except IFlowNotConfiguredError as e:
-                return JSONResponse(
-                    status_code=503,
-                    content={"type": "error", "error": {"type": "iflow_not_configured", "message": str(e)}}
-                )
+                return _create_anthropic_error_response(503, str(e), "iflow_not_configured")
             except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
                 return _create_anthropic_busy_response(e)
 
@@ -1055,21 +1260,42 @@ async def messages_anthropic(request: Request):
                 )
             except Exception as e:
                 await lease.close()
-                status_code, error_msg, error_type = _extract_upstream_error(e)
-                log_upstream_failure(
+                return _map_anthropic_exception(
                     e,
-                    status_code=status_code,
-                    error_msg=error_msg,
-                    error_type=error_type,
                     lease=lease,
                     request_body=openai_body,
                     endpoint="anthropic.messages",
                     stream=True,
                 )
-                return JSONResponse(
-                    status_code=status_code,
-                    content={"type": "error", "error": {"type": error_type, "message": error_msg}},
+            try:
+                first_chunk, stream_gen = await _prime_stream_generator(stream_gen)
+            except Exception as e:
+                await lease.close()
+                return _map_anthropic_exception(
+                    e,
+                    lease=lease,
+                    request_body=openai_body,
+                    endpoint="anthropic.messages",
+                    stream=True,
                 )
+            if first_chunk is None:
+                await lease.close()
+                logger.warning(
+                    "Anthropic 上游流式响应为空: account=%s, label=%s, model=%s",
+                    lease.account.id,
+                    lease.account.label,
+                    mapped_model,
+                )
+                return _create_anthropic_error_response(502, "上游流式响应为空", "api_error")
+
+            stream_gen = _observe_stream_generator_errors(
+                stream_gen,
+                lease=lease,
+                request_body=openai_body,
+                endpoint="anthropic.messages",
+                stream=True,
+            )
+
             async def close_lease() -> None:
                 await lease.close()
 
@@ -1083,10 +1309,7 @@ async def messages_anthropic(request: Request):
             try:
                 lease = await _acquire_upstream_lease()
             except IFlowNotConfiguredError as e:
-                return JSONResponse(
-                    status_code=503,
-                    content={"type": "error", "error": {"type": "iflow_not_configured", "message": str(e)}}
-                )
+                return _create_anthropic_error_response(503, str(e), "iflow_not_configured")
             except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
                 return _create_anthropic_busy_response(e)
 
@@ -1099,20 +1322,12 @@ async def messages_anthropic(request: Request):
                 )
                 openai_result = await _run_nonstream_with_lease(lease, openai_body)
             except Exception as e:
-                status_code, error_msg, error_type = _extract_upstream_error(e)
-                log_upstream_failure(
+                return _map_anthropic_exception(
                     e,
-                    status_code=status_code,
-                    error_msg=error_msg,
-                    error_type=error_type,
                     lease=lease,
                     request_body=openai_body,
                     endpoint="anthropic.messages",
                     stream=False,
-                )
-                return JSONResponse(
-                    status_code=status_code,
-                    content={"type": "error", "error": {"type": error_type, "message": error_msg}},
                 )
             finally:
                 await lease.close()
@@ -1125,7 +1340,7 @@ async def messages_anthropic(request: Request):
             return JSONResponse(content=anthropic_result)
 
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+        return _create_anthropic_error_response(400, f"Invalid JSON: {e}", "invalid_request_error")
     except Exception as e:
         error_msg = str(e)
         resp = getattr(e, "response", None)
@@ -1136,14 +1351,7 @@ async def messages_anthropic(request: Request):
             except Exception:
                 pass
         # Anthropic 格式的错误响应
-        error_response = {
-            "type": "error",
-            "error": {
-                "type": "api_error",
-                "message": error_msg
-            }
-        }
-        return JSONResponse(content=error_response, status_code=500)
+        return _create_anthropic_error_response(500, error_msg, "api_error")
 
 
 @app.post("/")
@@ -1153,93 +1361,17 @@ async def root_post(request: Request):
     try:
         body_bytes = await request.body()
         body = json.loads(body_bytes.decode("utf-8"))
-        
-        # 简单启发式：如果请求中没有 choices 相关字段，默认使用 Anthropic 格式
-        # 因为 CCR 主要使用 Anthropic 格式
-        # 但为了安全起见，默认使用 OpenAI 格式
-        stream = body.get("stream", False)
-        if stream:
-            try:
-                lease = await _acquire_upstream_lease()
-            except IFlowNotConfiguredError as e:
-                return create_error_response(503, str(e), "iflow_not_configured")
-            except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
-                return _create_openai_busy_response(e)
-
-            log_upstream_request_context(
-                lease,
-                body,
-                endpoint="root_post",
-                stream=True,
-            )
-            try:
-                stream_gen = await lease.proxy.chat_completions(
-                    body,
-                    stream=True,
-                    apply_concurrency_limit=False,
-                )
-            except Exception as e:
-                await lease.close()
-                return _map_upstream_exception(
-                    e,
-                    lease=lease,
-                    request_body=body,
-                    endpoint="root_post",
-                    stream=True,
-                )
-
-            async def generate_with_lease():
-                """持有账号租约直到整个流式传输结束。"""
-                chunk_count = 0
-                try:
-                    async for chunk in stream_gen:
-                        chunk_count += 1
-                        yield chunk
-                except asyncio.CancelledError:
-                    logger.info("客户端取消 root 流式请求，立即释放账号令牌: %s", lease.account.id)
-                    raise
-                finally:
-                    logger.debug("流式完成 (root_post): account=%s, chunks=%d", lease.account.id, chunk_count)
-                    await lease.close()
-            
-            return StreamingResponse(
-                generate_with_lease(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-            )
-        else:
-            try:
-                lease = await _acquire_upstream_lease()
-            except IFlowNotConfiguredError as e:
-                return create_error_response(503, str(e), "iflow_not_configured")
-            except (UpstreamQueueFullError, asyncio.TimeoutError) as e:
-                return _create_openai_busy_response(e)
-
-            try:
-                log_upstream_request_context(
-                    lease,
-                    body,
-                    endpoint="root_post",
-                    stream=False,
-                )
-                result = await _run_nonstream_with_lease(lease, body)
-            except Exception as e:
-                return _map_upstream_exception(
-                    e,
-                    lease=lease,
-                    request_body=body,
-                    endpoint="root_post",
-                    stream=False,
-                )
-            finally:
-                await lease.close()
-            # 验证响应包含有效的 choices
-            if not result.get("choices"):
-                logger.error("API 响应缺少 choices 数组 (root_post): %s", json.dumps(result, ensure_ascii=False)[:500])
-                raise HTTPException(status_code=500, detail="API 响应格式错误: 缺少 choices 数组")
-            return JSONResponse(content=result)
+    except json.JSONDecodeError as e:
+        return create_error_response(400, f"Invalid JSON: {e}", "invalid_request_error")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    if _looks_like_anthropic_messages_request(body):
+        logger.info("根路径 POST 自动识别为 Anthropic Messages 格式")
+        return await messages_anthropic(request)
+
+    logger.info("根路径 POST 自动识别为 OpenAI Chat Completions 格式")
+    return await chat_completions_openai(request)
 
 
 @app.get("/models")

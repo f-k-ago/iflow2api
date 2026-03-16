@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -21,6 +22,7 @@ from .anthropic_compat import (
 
 
 AsyncCloser = Callable[[], Awaitable[None]]
+logger = logging.getLogger("iflow2api")
 
 
 def create_anthropic_error_response(
@@ -73,11 +75,21 @@ async def _iter_anthropic_stream_events(
     current_text_block_type: str | None = None
     current_text_block_index = -1
     tool_call_block_map: dict[int, dict[str, str | int]] = {}
-    current_tc_index = -1
+
+    async def close_open_tool_blocks() -> AsyncIterator[bytes]:
+        """关闭当前打开的 tool_use block。"""
+        for tool_state in sorted(
+            tool_call_block_map.values(),
+            key=lambda item: int(item["block_index"]),
+        ):
+            yield create_anthropic_content_block_stop(
+                int(tool_state["block_index"])
+            ).encode("utf-8")
+        tool_call_block_map.clear()
 
     async def process_parsed_chunk(parsed: dict[str, Any]) -> AsyncIterator[bytes]:
         nonlocal block_index, output_tokens, stop_reason
-        nonlocal current_text_block_type, current_text_block_index, current_tc_index
+        nonlocal current_text_block_type, current_text_block_index
 
         choices = parsed.get("choices", [])
         if not choices:
@@ -88,6 +100,9 @@ async def _iter_anthropic_stream_events(
 
         content, content_type = extract_content_from_delta(delta, preserve_reasoning)
         if content and content_type:
+            if tool_call_block_map:
+                async for event in close_open_tool_blocks():
+                    yield event
             if current_text_block_type != content_type:
                 if current_text_block_type is not None:
                     yield create_anthropic_content_block_stop(current_text_block_index).encode("utf-8")
@@ -117,10 +132,6 @@ async def _iter_anthropic_stream_events(
                 if current_text_block_type is not None:
                     yield create_anthropic_content_block_stop(current_text_block_index).encode("utf-8")
                     current_text_block_type = None
-                if current_tc_index >= 0 and current_tc_index in tool_call_block_map:
-                    yield create_anthropic_content_block_stop(
-                        int(tool_call_block_map[current_tc_index]["block_index"])
-                    ).encode("utf-8")
 
                 tool_block_index = block_index
                 block_index += 1
@@ -129,7 +140,6 @@ async def _iter_anthropic_stream_events(
                     "id": tool_id or "",
                     "name": tool_name or "",
                 }
-                current_tc_index = tool_index
                 yield create_anthropic_tool_use_block_start(
                     tool_block_index,
                     str(tool_call_block_map[tool_index]["id"]),
@@ -152,16 +162,19 @@ async def _iter_anthropic_stream_events(
     try:
         yield create_anthropic_stream_message_start(mapped_model).encode("utf-8")
 
-        async for chunk in stream_gen:
-            chunk_str = chunk if isinstance(chunk, str) else bytes(chunk).decode("utf-8", errors="replace")
-            buffer += chunk_str
+        try:
+            async for chunk in stream_gen:
+                chunk_str = chunk if isinstance(chunk, str) else bytes(chunk).decode("utf-8", errors="replace")
+                buffer += chunk_str
 
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                parsed = parse_openai_sse_chunk(line)
-                if parsed:
-                    async for event in process_parsed_chunk(parsed):
-                        yield event
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    parsed = parse_openai_sse_chunk(line)
+                    if parsed:
+                        async for event in process_parsed_chunk(parsed):
+                            yield event
+        except Exception as exc:
+            logger.error("Anthropic 流式适配中途异常，输出规范终止事件: %s", exc)
 
         for line in buffer.split("\n"):
             if not line.strip():
@@ -174,10 +187,9 @@ async def _iter_anthropic_stream_events(
         if current_text_block_type is not None:
             yield create_anthropic_content_block_stop(current_text_block_index).encode("utf-8")
 
-        if current_tc_index >= 0 and current_tc_index in tool_call_block_map:
-            yield create_anthropic_content_block_stop(
-                int(tool_call_block_map[current_tc_index]["block_index"])
-            ).encode("utf-8")
+        if tool_call_block_map:
+            async for event in close_open_tool_blocks():
+                yield event
 
         yield create_anthropic_message_delta(stop_reason, output_tokens).encode("utf-8")
         yield create_anthropic_message_stop().encode("utf-8")

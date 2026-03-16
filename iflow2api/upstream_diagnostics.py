@@ -138,6 +138,8 @@ def log_upstream_failure(
     request_body: dict[str, Any] | None = None,
     endpoint: str,
     stream: bool,
+    phase: str | None = None,
+    chunk_count: int | None = None,
 ) -> None:
     """记录上游失败时的安全诊断信息。"""
     context = build_lease_debug_context(
@@ -147,10 +149,13 @@ def log_upstream_failure(
         stream=stream,
     )
     payload_preview = extract_upstream_payload_preview(exc)
+    phase_text = phase or "-"
+    chunk_count_text = chunk_count if chunk_count is not None else "-"
     logger.warning(
         "上游请求失败: endpoint=%s, stream=%s, account_id=%s, label=%s, auth_type=%s, "
         "base_url=%s, api_key_fp=%s, has_session_id=%s, has_conversation_id=%s, model=%s, "
-        "messages=%s, tools=%s, status_code=%s, error_type=%s, message=%s, payload_preview=%s",
+        "messages=%s, tools=%s, phase=%s, chunk_count=%s, status_code=%s, error_type=%s, "
+        "message=%s, payload_preview=%s",
         context["endpoint"],
         context["stream"],
         context["account_id"],
@@ -163,6 +168,8 @@ def log_upstream_failure(
         context["model"],
         context["message_count"],
         context["tool_count"],
+        phase_text,
+        chunk_count_text,
         status_code,
         error_type,
         error_msg,

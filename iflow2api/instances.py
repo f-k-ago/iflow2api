@@ -3,7 +3,6 @@
 import json
 import logging
 import socket
-import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path

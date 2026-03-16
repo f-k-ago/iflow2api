@@ -1,7 +1,6 @@
 """配置加密模块 - 敏感配置加密存储"""
 
 import base64
-import hashlib
 import json
 import logging
 import os

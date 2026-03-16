@@ -17,7 +17,14 @@ from typing import Optional, Callable, Tuple
 from .account_pool import build_iflow_config_from_account
 from .oauth import IFlowOAuth
 from .config import IFlowConfig
-from .settings import AppSettings, UpstreamAccount, list_upstream_accounts, load_settings, save_settings, upsert_upstream_account
+from .settings import (
+    AppSettings,
+    UpstreamAccount,
+    list_upstream_accounts,
+    load_settings,
+    mutate_settings,
+    upsert_upstream_account,
+)
 from .transport import create_upstream_transport
 
 logger = logging.getLogger("iflow2api")
@@ -197,17 +204,17 @@ class OAuthTokenRefresher:
 
     def _persist_account(self, account: UpstreamAccount) -> bool:
         """将刷新后的账号写回配置。"""
-        settings = load_settings()
+        def _persist(settings: AppSettings) -> bool:
+            if settings.upstream_accounts:
+                existing_ids = {item.id for item in settings.upstream_accounts}
+                if account.id not in existing_ids and account.id != "legacy-primary":
+                    logger.info("账号已从配置中移除，跳过刷新结果写回: %s", account.id)
+                    return False
 
-        if settings.upstream_accounts:
-            existing_ids = {item.id for item in settings.upstream_accounts}
-            if account.id not in existing_ids and account.id != "legacy-primary":
-                logger.info("账号已从配置中移除，跳过刷新结果写回: %s", account.id)
-                return False
+            upsert_upstream_account(settings, account)
+            return True
 
-        upsert_upstream_account(settings, account)
-        save_settings(settings)
-        return True
+        return bool(mutate_settings(_persist))
 
     def _should_refresh(self, config: IFlowConfig) -> bool:
         """

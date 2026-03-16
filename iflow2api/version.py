@@ -8,7 +8,6 @@ import os
 import sys
 import platform
 from datetime import datetime
-from typing import Optional
 
 
 # 从 pyproject.toml 读取的版本号

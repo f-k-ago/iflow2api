@@ -104,6 +104,29 @@ def build_upstream_body_preview(raw_text: str, *, limit: int = 300) -> str:
     return collapsed[:limit]
 
 
+def mask_proxy_url(proxy: str) -> str:
+    """脱敏代理地址中的凭据，避免写入日志。"""
+    raw = str(proxy or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return raw
+
+    if not parsed.username:
+        return raw
+
+    host = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    username = urllib.parse.quote(parsed.username, safe="")
+    masked_userinfo = f"{username}:***"
+    masked_netloc = f"{masked_userinfo}@{host}{port}"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, masked_netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+
+
 def parse_upstream_business_error(payload: Any) -> UpstreamAPIError | None:
     """识别 iflow 上游在 HTTP 200 中返回的业务错误包。"""
     if not isinstance(payload, dict):
@@ -522,7 +545,7 @@ class IFlowProxy:
             )
 
             if proxy:
-                logger.info("使用上游代理: %s", proxy)
+                logger.info("使用上游代理: %s", mask_proxy_url(proxy))
             logger.info(
                 "上游传输层: backend=%s, configured_backend=%s, tls_impersonate=%s",
                 effective_backend,
@@ -1026,6 +1049,8 @@ class IFlowProxy:
                                                 else error_data.get("msg") or error_data.get("error", {}).get("message") or body_str[:200]
                                             )
                                         except json.JSONDecodeError:
+                                            error_data = None
+                                            upstream_error = None
                                             error_msg = body_str[:200] or "上游返回空响应"
 
                                         if telemetry_session.parent_observation_id:
@@ -1034,21 +1059,13 @@ class IFlowProxy:
                                             except Exception as telemetry_err:
                                                 logger.debug("emit run_error failed: %s", telemetry_err)
 
-                                        # 生成一个包含错误信息的 SSE chunk
-                                        error_chunk = {
-                                            "id": f"error-{int(time.time())}",
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": request_body.get("model", "unknown"),
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {"content": f"[API Error] {error_msg}"},
-                                                "finish_reason": "stop"
-                                            }]
-                                        }
-                                        yield ("data: " + json.dumps(error_chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
-                                        yield b"data: [DONE]\n\n"
-                                        return
+                                        if upstream_error is not None:
+                                            raise upstream_error
+                                        raise UpstreamAPIError(
+                                            response.status_code if 400 <= response.status_code <= 599 else 502,
+                                            error_msg,
+                                            payload=error_data,
+                                        )
 
                                     # 流式读取响应
                                     async for chunk in response.aiter_bytes():
