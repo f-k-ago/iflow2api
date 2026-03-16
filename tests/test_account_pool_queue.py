@@ -2,6 +2,7 @@ import asyncio
 from collections import deque
 
 import iflow2api.account_pool as account_pool_module
+import pytest
 from iflow2api.concurrency_limiter import get_concurrency_limiter
 from iflow2api.settings import AppSettings, UpstreamAccount
 
@@ -40,6 +41,7 @@ def _reset_pool_state(monkeypatch, settings: AppSettings) -> None:
     monkeypatch.setattr(account_pool_module, "_wait_queue", deque())
     monkeypatch.setattr(account_pool_module, "_waiter_sequence", 0)
     monkeypatch.setattr(account_pool_module, "_round_robin_index", 0)
+    monkeypatch.setattr(account_pool_module, "_account_cooldowns", {})
     limiter = get_concurrency_limiter(max_concurrent=1, force_new=True)
     monkeypatch.setattr(
         account_pool_module,
@@ -69,6 +71,28 @@ def test_queue_full_fails_fast(monkeypatch):
         await first_lease.close()
         second_lease = await asyncio.wait_for(second_task, timeout=1)
         await second_lease.close()
+
+    asyncio.run(scenario())
+
+
+def test_account_cooldown_blocks_then_recovers(monkeypatch):
+    settings = _make_settings(max_queued_requests=5)
+    settings.enable_concurrency_limit = False
+    _reset_pool_state(monkeypatch, settings)
+
+    async def scenario():
+        await account_pool_module.mark_account_cooldown(
+            "acct-1",
+            cooldown_seconds=0.2,
+            reason="unit_test",
+        )
+
+        with pytest.raises(account_pool_module.NoUpstreamAccountError):
+            await account_pool_module.acquire_account_lease(timeout=0.1)
+
+        await asyncio.sleep(0.25)
+        lease = await account_pool_module.acquire_account_lease(timeout=1)
+        await lease.close()
 
     asyncio.run(scenario())
 

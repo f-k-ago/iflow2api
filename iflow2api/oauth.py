@@ -4,7 +4,7 @@ import base64
 import secrets
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from .transport import BaseUpstreamTransport, create_upstream_transport
 
@@ -206,8 +206,9 @@ class IFlowOAuth:
 
         # iFlow API 要求 accessToken 作为 URL 查询参数传递
         # 参考 iflow-cli 实现
+        encoded_access_token = quote(access_token, safe="")
         response = await client.get(
-            f"{self.USER_INFO_URL}?accessToken={access_token}",
+            f"{self.USER_INFO_URL}?accessToken={encoded_access_token}",
             headers={
                 "Accept": "application/json",
                 "User-Agent": "iFlow-Cli",

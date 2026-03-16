@@ -14,7 +14,7 @@ import threading
 from datetime import datetime
 from typing import Optional, Callable, Tuple
 
-from .account_pool import build_iflow_config_from_account
+from .account_pool import build_iflow_config_from_account, clear_account_cooldown
 from .oauth import IFlowOAuth
 from .config import IFlowConfig
 from .settings import (
@@ -75,6 +75,7 @@ class OAuthTokenRefresher:
         # 上次刷新失败的时间，用于避免频繁重试
         self._last_failure_time: Optional[datetime] = None
         self._failure_count = 0
+        self._account_refresh_locks: dict[str, asyncio.Lock] = {}
 
     def set_refresh_callback(self, callback: Callable[[dict], None]):
         """
@@ -176,6 +177,71 @@ class OAuthTokenRefresher:
     def _account_label(account: UpstreamAccount) -> str:
         """返回账号日志标签。"""
         return (account.label or account.email or account.phone or "").strip() or "-"
+
+    def _get_account_refresh_lock(self, account_id: str) -> asyncio.Lock:
+        """获取账号级刷新锁，避免同一账号并发刷新。"""
+        normalized_id = (account_id or "").strip() or "unknown"
+        lock = self._account_refresh_locks.get(normalized_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._account_refresh_locks[normalized_id] = lock
+        return lock
+
+    async def refresh_account_now(
+        self,
+        account_id: str,
+        *,
+        reason: str = "manual",
+    ) -> bool:
+        """
+        立即刷新指定账号凭据（用于未授权场景自愈）。
+
+        Args:
+            account_id: 上游账号 ID
+            reason: 刷新触发原因（日志用途）
+
+        Returns:
+            True 表示刷新成功
+        """
+        normalized_id = (account_id or "").strip()
+        if not normalized_id:
+            logger.warning("立即刷新被忽略：account_id 为空 (reason=%s)", reason)
+            return False
+
+        lock = self._get_account_refresh_lock(normalized_id)
+        async with lock:
+            settings = load_settings()
+            account = next(
+                (item for item in self._iter_refresh_candidates(settings) if item.id == normalized_id),
+                None,
+            )
+            if account is None:
+                logger.warning(
+                    "立即刷新失败：账号不存在或无有效凭据: account_id=%s, reason=%s",
+                    normalized_id,
+                    reason,
+                )
+                return False
+
+            config = build_iflow_config_from_account(account)
+            logger.info(
+                "触发账号立即刷新: account_id=%s, auth_type=%s, reason=%s",
+                normalized_id,
+                config.auth_type or "unknown",
+                reason,
+            )
+            if config.auth_type == "oauth-iflow":
+                return await self._refresh_token_with_retry(account, config)
+            if config.auth_type == "cookie":
+                return await self._refresh_cookie_with_retry(account, config)
+
+            logger.warning(
+                "立即刷新失败：不支持的 auth_type: account_id=%s, auth_type=%s, reason=%s",
+                normalized_id,
+                config.auth_type or "unknown",
+                reason,
+            )
+            return False
 
     def _build_skip_reason(self, config: IFlowConfig) -> str:
         """给轮询日志提供跳过原因。"""
@@ -377,32 +443,18 @@ class OAuthTokenRefresher:
                 token_data = await oauth.refresh_token(config.oauth_refresh_token)
 
                 access_token = token_data.get("access_token", "")
-                refreshed_api_key = (account.api_key or config.api_key or "").strip()
-                user_info: dict[str, str] = {}
-                if access_token:
-                    try:
-                        raw_user_info = await oauth.get_user_info(access_token)
-                    except Exception as user_info_error:
-                        logger.warning(
-                            "OAuth token 已刷新，但获取用户信息失败，保留现有 api_key: account_id=%s, error=%s",
-                            account.id,
-                            user_info_error,
-                        )
-                    else:
-                        user_info = {
-                            "apiKey": str(raw_user_info.get("apiKey") or "").strip(),
-                            "email": str(raw_user_info.get("email") or "").strip(),
-                            "phone": str(raw_user_info.get("phone") or "").strip(),
-                        }
-                        if user_info["apiKey"]:
-                            refreshed_api_key = user_info["apiKey"]
-                        else:
-                            logger.warning(
-                                "OAuth token 已刷新，但用户信息中缺少 apiKey，保留现有 api_key: account_id=%s",
-                                account.id,
-                            )
+                if not access_token:
+                    raise ValueError("OAuth 刷新成功，但响应缺少 access_token")
+
+                raw_user_info = await oauth.get_user_info(access_token)
+                user_info: dict[str, str] = {
+                    "apiKey": str(raw_user_info.get("apiKey") or "").strip(),
+                    "email": str(raw_user_info.get("email") or "").strip(),
+                    "phone": str(raw_user_info.get("phone") or "").strip(),
+                }
+                refreshed_api_key = user_info["apiKey"]
                 if not refreshed_api_key:
-                    raise ValueError("OAuth 刷新成功，但无法确定可用的 apiKey")
+                    raise ValueError("OAuth 刷新成功，但用户信息缺少 apiKey")
 
                 config.api_key = refreshed_api_key
                 config.oauth_access_token = access_token
@@ -432,6 +484,7 @@ class OAuthTokenRefresher:
                 self._failure_count = 0
                 self._last_failure_time = None
 
+                await clear_account_cooldown(account.id, reason="refresh_success")
                 logger.info("Token 刷新成功: account_id=%s", account.id)
 
                 # 调用回调
@@ -579,6 +632,7 @@ class OAuthTokenRefresher:
 
                 self._failure_count = 0
                 self._last_failure_time = None
+                await clear_account_cooldown(account.id, reason="refresh_success")
                 logger.info("Cookie 模式 API Key 刷新成功: account_id=%s", account.id)
 
                 if self._on_refresh_callback:

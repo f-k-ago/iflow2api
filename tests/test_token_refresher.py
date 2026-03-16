@@ -57,6 +57,11 @@ def test_oauth_refresh_updates_api_key_from_user_info(monkeypatch):
         ),
     )
     monkeypatch.setattr(refresher, "_persist_account", lambda updated_account: True)
+    monkeypatch.setattr(
+        token_refresher_module,
+        "clear_account_cooldown",
+        lambda *args, **kwargs: asyncio.sleep(0, result=False),
+    )
 
     assert asyncio.run(refresher._refresh_token_with_retry(account, config)) is True
 
@@ -70,7 +75,7 @@ def test_oauth_refresh_updates_api_key_from_user_info(monkeypatch):
     assert account.phone == "13800000000"
 
 
-def test_oauth_refresh_keeps_existing_api_key_when_user_info_lookup_fails(monkeypatch):
+def test_oauth_refresh_fails_when_user_info_lookup_fails(monkeypatch):
     refresher = OAuthTokenRefresher(retry_count=1)
     account = _make_account(api_key="iflow-api-still-valid")
     config = build_iflow_config_from_account(account)
@@ -81,14 +86,45 @@ def test_oauth_refresh_keeps_existing_api_key_when_user_info_lookup_fails(monkey
         lambda: _BaseFakeOAuth(user_info_error=ValueError("boom")),
     )
     monkeypatch.setattr(refresher, "_persist_account", lambda updated_account: True)
+    monkeypatch.setattr(
+        token_refresher_module,
+        "clear_account_cooldown",
+        lambda *args, **kwargs: asyncio.sleep(0, result=False),
+    )
 
-    assert asyncio.run(refresher._refresh_token_with_retry(account, config)) is True
+    assert asyncio.run(refresher._refresh_token_with_retry(account, config)) is False
 
     assert config.api_key == "iflow-api-still-valid"
     assert account.api_key == "iflow-api-still-valid"
-    assert config.oauth_access_token == "oauth-access-new"
-    assert account.oauth_access_token == "oauth-access-new"
-    assert account.api_key != account.oauth_access_token
+    assert config.oauth_access_token == "oauth-access-old"
+    assert account.oauth_access_token == "oauth-access-old"
+
+
+def test_oauth_refresh_fails_when_user_info_missing_api_key(monkeypatch):
+    refresher = OAuthTokenRefresher(retry_count=1)
+    account = _make_account(api_key="iflow-api-still-valid")
+    config = build_iflow_config_from_account(account)
+
+    monkeypatch.setattr(
+        token_refresher_module,
+        "IFlowOAuth",
+        lambda: _BaseFakeOAuth(
+            user_info={
+                "apiKey": "",
+                "email": "demo@example.com",
+            }
+        ),
+    )
+    monkeypatch.setattr(refresher, "_persist_account", lambda updated_account: True)
+    monkeypatch.setattr(
+        token_refresher_module,
+        "clear_account_cooldown",
+        lambda *args, **kwargs: asyncio.sleep(0, result=False),
+    )
+
+    assert asyncio.run(refresher._refresh_token_with_retry(account, config)) is False
+    assert config.api_key == "iflow-api-still-valid"
+    assert account.api_key == "iflow-api-still-valid"
 
 
 def test_oauth_refresh_fails_if_no_api_key_can_be_determined(monkeypatch):
@@ -102,6 +138,11 @@ def test_oauth_refresh_fails_if_no_api_key_can_be_determined(monkeypatch):
         lambda: _BaseFakeOAuth(user_info_error=ValueError("boom")),
     )
     monkeypatch.setattr(refresher, "_persist_account", lambda updated_account: True)
+    monkeypatch.setattr(
+        token_refresher_module,
+        "clear_account_cooldown",
+        lambda *args, **kwargs: asyncio.sleep(0, result=False),
+    )
 
     assert asyncio.run(refresher._refresh_token_with_retry(account, config)) is False
     assert account.api_key == ""

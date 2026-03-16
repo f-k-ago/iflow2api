@@ -15,7 +15,13 @@ from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
-from .account_pool import NoUpstreamAccountError, UpstreamQueueFullError, acquire_account_lease
+from .account_pool import (
+    AUTH_FAILURE_COOLDOWN_SECONDS,
+    NoUpstreamAccountError,
+    UpstreamQueueFullError,
+    acquire_account_lease,
+    mark_account_cooldown,
+)
 from .anthropic_compat import (
     anthropic_to_openai_request,
     openai_to_anthropic_response,
@@ -118,6 +124,116 @@ def _normalize_error_status_code(status_code: object) -> int:
     return 502
 
 
+_account_auth_recovery_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+def _should_trigger_auth_recovery(status_code: int, error_type: str, error_msg: str) -> bool:
+    """判断是否需要触发账号未授权自愈。"""
+    normalized_type = str(error_type or "").strip().lower()
+    if normalized_type == "authentication_error" or status_code == 401:
+        return True
+
+    message = str(error_msg or "").strip().lower()
+    if "blocked due to unauthorized requests" in message:
+        return True
+    if "invalid apikey" in message or "api token expired" in message:
+        return True
+    return False
+
+
+async def _recover_account_after_auth_failure(
+    account_id: str,
+    *,
+    reason: str,
+    endpoint: str,
+) -> None:
+    """账号认证失败后执行冷却与立即刷新。"""
+    await mark_account_cooldown(
+        account_id,
+        cooldown_seconds=AUTH_FAILURE_COOLDOWN_SECONDS,
+        reason=reason,
+    )
+
+    refresher = _refresher
+    if refresher is None:
+        logger.warning(
+            "账号认证失败后未触发立即刷新（refresher 未就绪）: account_id=%s, endpoint=%s",
+            account_id,
+            endpoint,
+        )
+        return
+
+    refresh_fn = getattr(refresher, "refresh_account_now", None)
+    if refresh_fn is None:
+        logger.warning(
+            "账号认证失败后未触发立即刷新（refresh_account_now 不可用）: account_id=%s, endpoint=%s",
+            account_id,
+            endpoint,
+        )
+        return
+
+    try:
+        refreshed = await refresh_fn(account_id, reason=reason)
+    except Exception as exc:
+        logger.warning(
+            "账号认证失败后立即刷新异常: account_id=%s, endpoint=%s, error=%s",
+            account_id,
+            endpoint,
+            exc,
+        )
+        return
+    if refreshed:
+        logger.info(
+            "账号认证失败后立即刷新成功: account_id=%s, endpoint=%s",
+            account_id,
+            endpoint,
+        )
+        return
+
+    logger.warning(
+        "账号认证失败后立即刷新失败，维持冷却等待下次轮询: account_id=%s, endpoint=%s",
+        account_id,
+        endpoint,
+    )
+
+
+def _schedule_account_auth_recovery(
+    *,
+    lease: Any,
+    status_code: int,
+    error_type: str,
+    error_msg: str,
+    endpoint: str,
+) -> None:
+    """如命中未授权错误，则触发账号冷却+立即刷新自愈。"""
+    if not _should_trigger_auth_recovery(status_code, error_type, error_msg):
+        return
+    if lease is None:
+        return
+
+    account = getattr(lease, "account", None)
+    account_id = str(getattr(account, "id", "") or "").strip()
+    if not account_id:
+        return
+
+    existing = _account_auth_recovery_tasks.get(account_id)
+    if existing is not None and not existing.done():
+        return
+
+    reason = f"{endpoint}:{status_code}:{error_type}"
+    task = asyncio.create_task(
+        _recover_account_after_auth_failure(account_id, reason=reason, endpoint=endpoint)
+    )
+    _account_auth_recovery_tasks[account_id] = task
+
+    def _cleanup_task(_: asyncio.Task[None]) -> None:
+        current = _account_auth_recovery_tasks.get(account_id)
+        if current is task:
+            _account_auth_recovery_tasks.pop(account_id, None)
+
+    task.add_done_callback(_cleanup_task)
+
+
 def _map_upstream_exception(
     exc: Exception,
     *,
@@ -128,6 +244,13 @@ def _map_upstream_exception(
 ) -> JSONResponse:
     """将上游异常映射为兼容响应。"""
     status_code, error_msg, error_type = _extract_upstream_error(exc)
+    _schedule_account_auth_recovery(
+        lease=lease,
+        status_code=status_code,
+        error_type=error_type,
+        error_msg=error_msg,
+        endpoint=endpoint,
+    )
     log_upstream_failure(
         exc,
         status_code=status_code,
@@ -222,6 +345,13 @@ def _map_anthropic_exception(
 ) -> JSONResponse:
     """将上游异常映射为 Anthropic 兼容错误响应。"""
     status_code, error_msg, error_type = _extract_upstream_error(exc)
+    _schedule_account_auth_recovery(
+        lease=lease,
+        status_code=status_code,
+        error_type=error_type,
+        error_msg=error_msg,
+        endpoint=endpoint,
+    )
     log_upstream_failure(
         exc,
         status_code=status_code,
@@ -277,6 +407,13 @@ def _observe_stream_generator_errors(
                 yield chunk
         except Exception as exc:
             status_code, error_msg, error_type = _extract_upstream_error(exc)
+            _schedule_account_auth_recovery(
+                lease=lease,
+                status_code=status_code,
+                error_type=error_type,
+                error_msg=error_msg,
+                endpoint=endpoint,
+            )
             log_upstream_failure(
                 exc,
                 status_code=status_code,
@@ -1005,6 +1142,13 @@ async def chat_completions_openai(request: Request):
                 except Exception as e:
                     stream_failed = True
                     status_code, error_msg, error_type = _extract_upstream_error(e)
+                    _schedule_account_auth_recovery(
+                        lease=lease,
+                        status_code=status_code,
+                        error_type=error_type,
+                        error_msg=error_msg,
+                        endpoint="openai.chat_completions",
+                    )
                     log_upstream_failure(
                         e,
                         status_code=status_code,

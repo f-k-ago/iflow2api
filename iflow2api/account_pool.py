@@ -4,12 +4,17 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+import time
 from typing import Awaitable, Callable, Optional
 
 from .concurrency_limiter import ConcurrencyLimiter, get_concurrency_limiter
 from .config import IFlowConfig
 from .proxy import IFlowProxy
 from .settings import DEFAULT_BASE_URL, UpstreamAccount, get_enabled_upstream_accounts, load_settings
+
+import logging
+
+logger = logging.getLogger("iflow2api")
 
 
 class NoUpstreamAccountError(Exception):
@@ -21,6 +26,7 @@ class UpstreamQueueFullError(asyncio.TimeoutError):
 
 
 QUEUE_RECHECK_INTERVAL_SECONDS = 1.0
+AUTH_FAILURE_COOLDOWN_SECONDS = 5 * 60
 
 
 def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -86,6 +92,7 @@ _scheduler_lock = asyncio.Lock()
 _wait_queue: deque[_LeaseWaiter] = deque()
 _waiter_sequence = 0
 _round_robin_index = 0
+_account_cooldowns: dict[str, float] = {}
 
 
 def _next_waiter_sequence() -> int:
@@ -105,6 +112,29 @@ def _rotate_accounts_locked(accounts: list[UpstreamAccount]) -> list[UpstreamAcc
     start = _round_robin_index % len(accounts)
     _round_robin_index = (_round_robin_index + 1) % len(accounts)
     return accounts[start:] + accounts[:start]
+
+
+def _prune_expired_cooldowns_locked(now: Optional[float] = None) -> None:
+    """清理已过期的账号冷却条目。调用方需持有调度锁。"""
+    current = time.monotonic() if now is None else now
+    expired_ids = [
+        account_id
+        for account_id, expires_at in _account_cooldowns.items()
+        if expires_at <= current
+    ]
+    for account_id in expired_ids:
+        _account_cooldowns.pop(account_id, None)
+
+
+def _filter_available_accounts_locked(accounts: list[UpstreamAccount]) -> list[UpstreamAccount]:
+    """过滤掉处于冷却期的账号。调用方需持有调度锁。"""
+    now = time.monotonic()
+    _prune_expired_cooldowns_locked(now)
+    return [
+        account
+        for account in accounts
+        if _account_cooldowns.get(account.id, 0.0) <= now
+    ]
 
 
 def _wake_next_waiter_locked() -> None:
@@ -147,7 +177,8 @@ def _build_account_lease(
 
 def _try_allocate_lease_locked(settings, accounts: list[UpstreamAccount]) -> Optional[AccountLease]:
     """尝试立即分配一个租约。调用方需持有调度锁。"""
-    ordered_accounts = _rotate_accounts_locked(accounts)
+    available_accounts = _filter_available_accounts_locked(accounts)
+    ordered_accounts = _rotate_accounts_locked(available_accounts)
     if not settings.enable_concurrency_limit:
         if not ordered_accounts:
             return None
@@ -162,6 +193,49 @@ def _try_allocate_lease_locked(settings, accounts: list[UpstreamAccount]) -> Opt
                 limiter_key=account.id,
             )
     return None
+
+
+async def mark_account_cooldown(
+    account_id: str,
+    *,
+    cooldown_seconds: float = AUTH_FAILURE_COOLDOWN_SECONDS,
+    reason: str = "auth_failure",
+) -> None:
+    """将指定账号标记为短暂冷却，避免被立即重复调度。"""
+    normalized_account_id = (account_id or "").strip()
+    if not normalized_account_id:
+        return
+
+    cooldown = max(float(cooldown_seconds), 0.0)
+    expires_at = time.monotonic() + cooldown
+    async with _scheduler_lock:
+        _account_cooldowns[normalized_account_id] = expires_at
+        _wake_next_waiter_locked()
+    logger.warning(
+        "账号进入冷却期: account_id=%s, cooldown_seconds=%.1f, reason=%s",
+        normalized_account_id,
+        cooldown,
+        reason,
+    )
+
+
+async def clear_account_cooldown(account_id: str, *, reason: str = "manual") -> bool:
+    """清除账号冷却标记。"""
+    normalized_account_id = (account_id or "").strip()
+    if not normalized_account_id:
+        return False
+
+    async with _scheduler_lock:
+        removed = _account_cooldowns.pop(normalized_account_id, None) is not None
+        if removed:
+            _wake_next_waiter_locked()
+    if removed:
+        logger.info(
+            "账号冷却已解除: account_id=%s, reason=%s",
+            normalized_account_id,
+            reason,
+        )
+    return removed
 
 
 async def acquire_account_lease(timeout: float = 300.0) -> AccountLease:
@@ -244,6 +318,9 @@ async def acquire_account_lease(timeout: float = 300.0) -> AccountLease:
 
 def get_account_pool_stats() -> dict[str, int]:
     """返回账号池排队概况。"""
+    now = time.monotonic()
+    active_cooldowns = sum(1 for expires_at in _account_cooldowns.values() if expires_at > now)
     return {
         "queued_requests": len(_wait_queue),
+        "cooldown_accounts": active_cooldowns,
     }
