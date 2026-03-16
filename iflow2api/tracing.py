@@ -76,11 +76,15 @@ def get_current_traceparent() -> str:
 @contextmanager
 def session_trace_context(traceparent: str | None) -> Iterator[None]:
     """设置当前协程上下文中的 session 级 traceparent 回退值。"""
+    previous = _current_session_traceparent.get()
     token = _current_session_traceparent.set((traceparent or "").strip())
     try:
         yield
     finally:
-        _current_session_traceparent.reset(token)
+        try:
+            _current_session_traceparent.reset(token)
+        except ValueError:
+            _current_session_traceparent.set(previous)
 
 
 @contextmanager
@@ -122,4 +126,7 @@ def span_context(
         span.status = "ok"
     finally:
         span.end_time_ms = int(time.time() * 1000)
-        _current_span.reset(token)
+        try:
+            _current_span.reset(token)
+        except ValueError:
+            _current_span.set(parent)
